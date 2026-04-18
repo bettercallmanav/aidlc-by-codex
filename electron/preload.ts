@@ -15,7 +15,7 @@ contextBridge.exposeInMainWorld("desktopBridge", {
     workspacePath?: string
   }) => ipcRenderer.invoke("project:create", payload),
   selectProject: async (projectId: string) => ipcRenderer.invoke("project:select", projectId),
-  createSession: async (payload: { projectId: string; title: string }) =>
+  createSession: async (payload: { projectId: string; title?: string }) =>
     ipcRenderer.invoke("session:create", payload),
   renameProject: async (payload: { projectId: string; name: string }) =>
     ipcRenderer.invoke("project:rename", payload),
@@ -34,6 +34,33 @@ contextBridge.exposeInMainWorld("desktopBridge", {
     sessionId: string
     body: string
   }) => ipcRenderer.invoke("session:send-message", payload),
+  updateSessionPreferences: async (payload: {
+    projectId: string
+    sessionId: string
+    selectedModel?: string | null
+    selectedAgentId?:
+      | "auto"
+      | "workspace"
+      | "plan"
+      | "build"
+      | "discovery"
+      | "architecture"
+      | "journey"
+      | "wireframe"
+      | "coder"
+      | "testing"
+      | "devops"
+      | "handover"
+  }) => ipcRenderer.invoke("session:update-preferences", payload),
+  interruptSession: async (payload: { projectId: string; sessionId: string }) =>
+    ipcRenderer.invoke("session:interrupt", payload),
+  onCodexEvent: (listener: (event: unknown) => void) => {
+    const handler = (_event: unknown, payload: unknown) => listener(payload)
+    ipcRenderer.on("codex:event", handler)
+    return () => {
+      ipcRenderer.removeListener("codex:event", handler)
+    }
+  },
   listWorkspaceEntries: async (payload: {
     projectId: string
     relativePath?: string

@@ -1,4 +1,5 @@
 import { BrowserWindow, dialog, type IpcMainInvokeEvent, type OpenDialogOptions } from "electron"
+import { interruptCodexSession } from "./codex-app-server.js"
 import {
   archiveSession,
   createProject,
@@ -13,6 +14,7 @@ import {
   selectProject,
   selectSession,
   sendSessionMessage,
+  updateSessionPreferences,
   updatePhaseStatus
 } from "./project-service.js"
 
@@ -43,6 +45,23 @@ type SendMessagePayload = SessionMessagesPayload & {
   body: string
 }
 
+type UpdateSessionPreferencesPayload = SessionMessagesPayload & {
+  selectedModel?: string | null
+  selectedAgentId?:
+    | "auto"
+    | "workspace"
+    | "plan"
+    | "build"
+    | "discovery"
+    | "architecture"
+    | "journey"
+    | "wireframe"
+    | "coder"
+    | "testing"
+    | "devops"
+    | "handover"
+}
+
 type WorkspaceEntriesPayload = {
   projectId: string
   relativePath?: string
@@ -61,7 +80,7 @@ export const desktopBridgeHandlers = {
   selectProject: async (_event: IpcMainInvokeEvent, projectId: string) => selectProject(projectId),
   createSession: async (
     _event: IpcMainInvokeEvent,
-    payload: { projectId: string; title: string }
+    payload: { projectId: string; title?: string }
   ) => createSession(payload.projectId, payload.title),
   renameProject: async (
     _event: IpcMainInvokeEvent,
@@ -87,6 +106,16 @@ export const desktopBridgeHandlers = {
     getSessionMessages(payload.projectId, payload.sessionId),
   sendSessionMessage: async (_event: IpcMainInvokeEvent, payload: SendMessagePayload) =>
     sendSessionMessage(payload.projectId, payload.sessionId, payload.body),
+  updateSessionPreferences: async (
+    _event: IpcMainInvokeEvent,
+    payload: UpdateSessionPreferencesPayload
+  ) =>
+    updateSessionPreferences(payload.projectId, payload.sessionId, {
+      selectedModel: payload.selectedModel,
+      selectedAgentId: payload.selectedAgentId
+    }),
+  interruptSession: async (_event: IpcMainInvokeEvent, payload: SessionMessagesPayload) =>
+    interruptCodexSession(payload.projectId, payload.sessionId),
   listWorkspaceEntries: async (_event: IpcMainInvokeEvent, payload: WorkspaceEntriesPayload) =>
     listWorkspaceEntries(payload.projectId, payload.relativePath, payload.scope),
   readWorkspaceFile: async (_event: IpcMainInvokeEvent, payload: WorkspaceFilePayload) =>

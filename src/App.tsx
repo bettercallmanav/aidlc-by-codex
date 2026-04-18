@@ -1,4 +1,15 @@
-import { startTransition, useEffect, useRef, useState, type CSSProperties, type FormEvent } from "react"
+import {
+  startTransition,
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+  type CSSProperties,
+  type FormEvent,
+  type KeyboardEvent,
+  type MouseEvent as ReactMouseEvent,
+  type ReactNode
+} from "react"
 
 type ShellInfo = {
   appName: string
@@ -18,7 +29,20 @@ type PhaseStatus =
   | "changes_requested"
   | "failed"
 type SessionStatus = "active" | "idle" | "archived"
-type SessionKind = "setup" | "analysis" | "discovery" | "architecture" | "implementation" | "general"
+type SessionTitleSource = "seeded" | "pending_first_message" | "message" | "manual"
+type SessionKind =
+  | "setup"
+  | "analysis"
+  | "discovery"
+  | "architecture"
+  | "journey"
+  | "wireframe"
+  | "implementation"
+  | "testing"
+  | "devops"
+  | "handover"
+  | "general"
+type SessionAgentId = "auto" | "workspace" | "plan" | "build" | WorkflowPhase["id"]
 type SessionMessageRole = "system" | "user" | "assistant"
 type ShellSurface = "home" | "setup" | "workspace"
 type InspectorTab = "review" | "files" | "sdlc"
@@ -40,10 +64,13 @@ type SessionRecord = {
   id: string
   projectId: string
   title: string
+  titleSource: SessionTitleSource
   kind: SessionKind
   status: SessionStatus
   summary: string
   preview: string
+  selectedModel: string | null
+  selectedAgentId: SessionAgentId
   createdAt: string
   updatedAt: string
 }
@@ -74,11 +101,19 @@ type ArtifactRecord = {
   createdAt: string
 }
 
+type PendingHandoff = {
+  fromPhaseId: PhaseId
+  toPhaseId: PhaseId
+  reason?: string
+  createdAt: string
+}
+
 type WorkflowState = {
   projectId: string
   activePhaseId: string | null
   phases: WorkflowPhase[]
   artifacts: ArtifactRecord[]
+  pendingHandoff?: PendingHandoff | null
 }
 
 type WorkspaceEntry = {
@@ -92,9 +127,10 @@ type WorkspaceEntry = {
 type WorkspaceFileContent = {
   path: string
   name: string
-  kind: "markdown" | "json" | "code" | "text" | "directory" | "unsupported" | "not_found"
+  kind: "markdown" | "json" | "code" | "text" | "image" | "directory" | "unsupported" | "not_found"
   language?: string
   content?: string
+  dataUrl?: string
 }
 
 type DashboardData = {
@@ -127,8 +163,10 @@ type WorkspaceLayoutState = {
   sidebarOpen: boolean
   inspectorOpen: boolean
   inspectorTab: InspectorTab
+  centerWidth: number
   inspectorWidth: number
   reviewSidebarWidth: number
+  expandedDirectories: Record<string, boolean>
   openedFileTabs: string[]
   activeFileTab: string | null
   selectedReviewFile: string | null
@@ -139,6 +177,31 @@ type WorkspaceLayoutState = {
 type SendSessionMessageResult = {
   dashboard: DashboardData
   messages: SessionMessageRecord[]
+  uiAction?: {
+    type: "open_file"
+    relativePath: string
+    targetTab: "files" | "review"
+  } | null
+}
+
+type CodexChatEvent =
+  | { projectId: string; sessionId: string; type: "turn_started" }
+  | { projectId: string; sessionId: string; type: "assistant_delta"; delta: string }
+  | { projectId: string; sessionId: string; type: "command_started"; command: string; cwd?: string }
+  | { projectId: string; sessionId: string; type: "command_output"; text: string }
+  | { projectId: string; sessionId: string; type: "command_completed"; command: string; exitCode: number | null }
+  | { projectId: string; sessionId: string; type: "file_change"; summary: string }
+  | { projectId: string; sessionId: string; type: "tool_started"; tool: string }
+  | { projectId: string; sessionId: string; type: "tool_completed"; tool: string }
+  | { projectId: string; sessionId: string; type: "turn_completed" }
+  | { projectId: string; sessionId: string; type: "interrupted"; reason?: string }
+  | { projectId: string; sessionId: string; type: "error"; message: string }
+
+type LiveTurnState = {
+  projectId: string
+  sessionId: string
+  assistantText: string
+  started: boolean
 }
 
 type DesktopBridge = {
@@ -146,7 +209,7 @@ type DesktopBridge = {
   getDashboardData: () => Promise<DashboardData>
   createProject: (payload: EntryFormState) => Promise<DashboardData>
   selectProject: (projectId: string) => Promise<DashboardData>
-  createSession: (payload: { projectId: string; title: string }) => Promise<DashboardData>
+  createSession: (payload: { projectId: string; title?: string }) => Promise<DashboardData>
   renameProject: (payload: { projectId: string; name: string }) => Promise<DashboardData>
   selectSession: (payload: { projectId: string; sessionId: string }) => Promise<DashboardData>
   renameSession: (payload: {
@@ -162,6 +225,14 @@ type DesktopBridge = {
     sessionId: string
     body: string
   }) => Promise<SendSessionMessageResult>
+  updateSessionPreferences: (payload: {
+    projectId: string
+    sessionId: string
+    selectedModel?: string | null
+    selectedAgentId?: SessionAgentId
+  }) => Promise<DashboardData>
+  interruptSession: (payload: { projectId: string; sessionId: string }) => Promise<boolean>
+  onCodexEvent: (listener: (event: CodexChatEvent) => void) => () => void
   listWorkspaceEntries: (payload: {
     projectId: string
     relativePath?: string
@@ -212,8 +283,10 @@ const defaultWorkspaceLayout: WorkspaceLayoutState = {
   sidebarOpen: false,
   inspectorOpen: true,
   inspectorTab: "review",
+  centerWidth: 680,
   inspectorWidth: 560,
   reviewSidebarWidth: 240,
+  expandedDirectories: {},
   openedFileTabs: [],
   activeFileTab: null,
   selectedReviewFile: null,
@@ -223,6 +296,20 @@ const defaultWorkspaceLayout: WorkspaceLayoutState = {
 
 const browserStoreKey = "codex-buildathon-browser-store"
 const workspaceLayoutKey = "codex-buildathon-workspace-layout"
+const workspaceMinCenterWidth = 460
+const workspaceMaxCenterWidth = 1180
+const inspectorMinMainWidth = 360
+const inspectorMaxMainWidth = 960
+const inspectorMinSidebarWidth = 220
+const inspectorMaxSidebarWidth = 420
+const paneResizerWidth = 12
+
+const getShouldShowInspectorMain = (layout: WorkspaceLayoutState) =>
+  layout.inspectorTab === "files"
+    ? Boolean(layout.activeFileTab)
+    : layout.inspectorTab === "review"
+      ? Boolean(layout.selectedReviewFile)
+      : false
 
 const phaseDefinitions: Array<Pick<WorkflowPhase, "id" | "name" | "summary">> = [
   {
@@ -309,6 +396,41 @@ const phaseStatusLabels: Record<PhaseStatus, string> = {
   failed: "Failed"
 }
 
+const phaseStatusMeta: Record<
+  PhaseStatus,
+  {
+    glyph: string
+    shortLabel: string
+  }
+> = {
+  not_started: { glyph: "○", shortLabel: "Idle" },
+  running: { glyph: "●", shortLabel: "Live" },
+  review_ready: { glyph: "◐", shortLabel: "Review" },
+  approved: { glyph: "✓", shortLabel: "Done" },
+  changes_requested: { glyph: "↺", shortLabel: "Revise" },
+  failed: { glyph: "!", shortLabel: "Failed" }
+}
+
+const modelOptions = [
+  { value: "", label: "Default model" },
+  { value: "gpt-5.2-codex", label: "GPT-5.2 Codex" },
+  { value: "gpt-5.1-codex-max", label: "GPT-5.1 Codex Max" },
+  { value: "gpt-5.4", label: "GPT-5.4" },
+  { value: "gpt-5.2", label: "GPT-5.2" },
+  { value: "gpt-5.3-codex", label: "GPT-5.3 Codex" }
+] as const
+
+const sessionAgentOptions: Array<{ value: SessionAgentId; label: string }> = [
+  { value: "auto", label: "Auto" },
+  { value: "workspace", label: "Workspace" },
+  { value: "plan", label: "Plan" },
+  { value: "build", label: "Build" },
+  ...phaseDefinitions.map((phase) => ({
+    value: phase.id as SessionAgentId,
+    label: phase.name
+  }))
+]
+
 const entryCards = [
   {
     projectType: "new_project" as const,
@@ -326,12 +448,12 @@ const entryCards = [
   }
 ]
 
-const journeyStages = [
-  "1. Create or import a workspace root",
-  "2. Choose the workflow mode",
-  "3. Open focused sessions inside the project",
-  "4. Review artifacts and move phase by phase"
-]
+// const journeyStages = [
+//   "1. Create or import a workspace root",
+//   "2. Choose the workflow mode",
+//   "3. Open focused sessions inside the project",
+//   "4. Review artifacts and move phase by phase"
+// ]
 
 const fallbackShellInfo: ShellInfo = {
   appName: "Codex Buildathon (Browser Fallback)",
@@ -385,6 +507,8 @@ const getProjectInitials = (name: string) =>
     .map((part) => part[0]?.toUpperCase() ?? "")
     .join("") || "PR"
 
+const getPathTail = (value: string) => value.split("/").filter(Boolean).pop() ?? value
+
 const getCacheKey = (projectId: string, relativePath: string) => `${projectId}:${relativePath}`
 
 const getPhaseFolderRelativePath = (phaseId: string) =>
@@ -400,10 +524,136 @@ const flattenFilePaths = (entries: WorkspaceEntry[]): string[] =>
     entry.type === "file" ? [entry.path] : flattenFilePaths(entry.children ?? [])
   )
 
+const renderInlineMarkdown = (text: string, keyPrefix: string): ReactNode[] =>
+  text.split(/(`[^`]+`|\*\*[^*]+\*\*)/g).filter(Boolean).map((part, index) => {
+    if (part.startsWith("**") && part.endsWith("**") && part.length > 4) {
+      return <strong key={`${keyPrefix}-strong-${index}`}>{part.slice(2, -2)}</strong>
+    }
+
+    if (part.startsWith("`") && part.endsWith("`") && part.length > 2) {
+      return (
+        <code key={`${keyPrefix}-code-${index}`} className="markdown-inline-code">
+          {part.slice(1, -1)}
+        </code>
+      )
+    }
+
+    return part
+  })
+
+const renderMarkdownContent = (content: string): JSX.Element[] => {
+  const lines = content.replace(/\r/g, "").split("\n")
+  const blocks: JSX.Element[] = []
+  let index = 0
+  let blockKey = 0
+
+  while (index < lines.length) {
+    const line = lines[index]
+    const trimmed = line.trim()
+
+    if (!trimmed) {
+      index += 1
+      continue
+    }
+
+    if (trimmed.startsWith("```")) {
+      const language = trimmed.slice(3).trim()
+      const codeLines: string[] = []
+      index += 1
+
+      while (index < lines.length && !lines[index].trim().startsWith("```")) {
+        codeLines.push(lines[index])
+        index += 1
+      }
+
+      if (index < lines.length) {
+        index += 1
+      }
+
+      blocks.push(
+        <pre key={`markdown-block-${blockKey++}`} className="markdown-code-block">
+          <code data-language={language || undefined}>{codeLines.join("\n")}</code>
+        </pre>
+      )
+      continue
+    }
+
+    const headingMatch = trimmed.match(/^(#{1,6})\s+(.*)$/)
+
+    if (headingMatch) {
+      const level = Math.min(headingMatch[1].length, 4)
+      const text = headingMatch[2]
+      const className = `markdown-heading markdown-heading-${level}`
+
+      blocks.push(
+        <div key={`markdown-block-${blockKey++}`} className={className}>
+          {renderInlineMarkdown(text, `heading-${blockKey}`)}
+        </div>
+      )
+      index += 1
+      continue
+    }
+
+    if (/^[-*]\s+/.test(trimmed)) {
+      const items: string[] = []
+
+      while (index < lines.length && /^[-*]\s+/.test(lines[index].trim())) {
+        items.push(lines[index].trim().replace(/^[-*]\s+/, ""))
+        index += 1
+      }
+
+      blocks.push(
+        <ul key={`markdown-block-${blockKey++}`} className="markdown-list">
+          {items.map((item, itemIndex) => (
+            <li key={`markdown-item-${blockKey}-${itemIndex}`}>
+              {renderInlineMarkdown(item, `list-${blockKey}-${itemIndex}`)}
+            </li>
+          ))}
+        </ul>
+      )
+      continue
+    }
+
+    const paragraphLines: string[] = [trimmed]
+    index += 1
+
+    while (index < lines.length) {
+      const candidate = lines[index].trim()
+
+      if (!candidate || candidate.startsWith("```") || /^#{1,6}\s+/.test(candidate) || /^[-*]\s+/.test(candidate)) {
+        break
+      }
+
+      paragraphLines.push(candidate)
+      index += 1
+    }
+
+    blocks.push(
+      <p key={`markdown-block-${blockKey++}`} className="markdown-paragraph">
+        {renderInlineMarkdown(paragraphLines.join(" "), `paragraph-${blockKey}`)}
+      </p>
+    )
+  }
+
+  return blocks
+}
+
+const renderThreadMessageBody = (message: SessionMessageRecord) => {
+  if (message.role === "user") {
+    return <p className="thread-card-body">{message.body}</p>
+  }
+
+  return <div className="thread-card-body-rich">{renderMarkdownContent(message.body)}</div>
+}
+
 const clampLayout = (value: WorkspaceLayoutState): WorkspaceLayoutState => ({
   ...value,
-  inspectorWidth: Math.max(420, Math.min(860, value.inspectorWidth)),
-  reviewSidebarWidth: Math.max(180, Math.min(320, value.reviewSidebarWidth))
+  centerWidth: Math.max(workspaceMinCenterWidth, Math.min(workspaceMaxCenterWidth, value.centerWidth)),
+  inspectorWidth: Math.max(inspectorMinMainWidth, Math.min(inspectorMaxMainWidth, value.inspectorWidth)),
+  reviewSidebarWidth: Math.max(
+    inspectorMinSidebarWidth,
+    Math.min(inspectorMaxSidebarWidth, value.reviewSidebarWidth)
+  )
 })
 
 const readWorkspaceLayout = (): WorkspaceLayoutState => {
@@ -448,7 +698,8 @@ const buildInitialWorkflowState = (projectId: string): WorkflowState => {
       status: index === 0 ? "running" : "not_started",
       lastUpdatedAt: now
     })),
-    artifacts: []
+    artifacts: [],
+    pendingHandoff: null
   }
 }
 
@@ -459,6 +710,46 @@ const getActiveOrFocusedPhase = (workflow: WorkflowState | null) =>
   ) ??
   workflow?.phases[0] ??
   null
+
+const getSelectedAgentPhase = (
+  session: SessionRecord | null,
+  workflow: WorkflowState | null
+) => {
+  if (
+    !session ||
+    session.selectedAgentId === "workspace" ||
+    session.selectedAgentId === "plan" ||
+    session.selectedAgentId === "build"
+  ) {
+    return null
+  }
+
+  if (session.selectedAgentId !== "auto") {
+    return workflow?.phases.find((phase) => phase.id === session.selectedAgentId) ?? null
+  }
+
+  return getActiveOrFocusedPhase(workflow)
+}
+
+const getSelectedAgentLabel = (session: SessionRecord | null, workflow: WorkflowState | null) => {
+  if (!session) {
+    return "Assistant"
+  }
+
+  if (session.selectedAgentId === "workspace") {
+    return "Workspace"
+  }
+
+  if (session.selectedAgentId === "plan") {
+    return "Plan"
+  }
+
+  if (session.selectedAgentId === "build") {
+    return "Build"
+  }
+
+  return getSelectedAgentPhase(session, workflow)?.name ?? "Assistant"
+}
 
 const buildSeedArtifact = (project: ProjectRecord, phase: WorkflowPhase) => `# ${phase.name} - ${project.name}
 
@@ -491,6 +782,38 @@ const buildBrowserProjectContext = (project: ProjectRecord) =>
     2
   )
 
+const pendingSessionTitle = "New session"
+
+const isSessionTitleSource = (value: unknown): value is SessionTitleSource =>
+  value === "seeded" ||
+  value === "pending_first_message" ||
+  value === "message" ||
+  value === "manual"
+
+const normalizeSessionTitleSource = (
+  titleSource: unknown,
+  title: string | null | undefined
+): SessionTitleSource => {
+  if (isSessionTitleSource(titleSource)) {
+    return titleSource
+  }
+
+  return title?.trim() === pendingSessionTitle ? "pending_first_message" : "manual"
+}
+
+const deriveSessionTitleFromMessage = (message: string) => {
+  const normalized = message.replace(/\s+/g, " ").trim()
+
+  if (!normalized) {
+    return pendingSessionTitle
+  }
+
+  const maxLength = 56
+  return normalized.length <= maxLength
+    ? normalized
+    : `${normalized.slice(0, maxLength - 3).trimEnd()}...`
+}
+
 const getEmptyBrowserStore = (): BrowserStoreState => ({
   projects: [],
   sessions: [],
@@ -513,9 +836,27 @@ const readBrowserStore = (): BrowserStoreState => {
       return getEmptyBrowserStore()
     }
 
-    return {
+    const parsed = {
       ...getEmptyBrowserStore(),
       ...(JSON.parse(rawValue) as Partial<BrowserStoreState>)
+    }
+
+    return {
+      ...parsed,
+      sessions: (parsed.sessions ?? []).map((session) => ({
+        ...session,
+        titleSource: normalizeSessionTitleSource(session.titleSource, session.title),
+        selectedModel:
+          typeof session.selectedModel === "string" ? session.selectedModel.trim() || null : null,
+        selectedAgentId:
+          session.selectedAgentId === "workspace" ||
+          session.selectedAgentId === "plan" ||
+          session.selectedAgentId === "build" ||
+          session.selectedAgentId === "auto" ||
+          phaseDefinitions.some((phase) => phase.id === session.selectedAgentId)
+            ? session.selectedAgentId
+            : "auto"
+      }))
     }
   } catch {
     return getEmptyBrowserStore()
@@ -536,20 +877,31 @@ const buildSessionRecord = (
     summary?: string
     preview?: string
     status?: SessionStatus
+    titleSource?: SessionTitleSource
   }
 ): SessionRecord => {
   const now = new Date().toISOString()
+  const titleSource = options?.titleSource ?? "manual"
 
   return {
     id: createId(),
     projectId: project.id,
     title,
+    titleSource,
     kind: options?.kind ?? "general",
     status: options?.status ?? "active",
-    summary: options?.summary ?? `Task-focused session for ${title.toLowerCase()}.`,
+    summary:
+      options?.summary ??
+      (titleSource === "pending_first_message"
+        ? "Start a focused thread. The first message will set the session title."
+        : `Task-focused session for ${title.toLowerCase()}.`),
     preview:
       options?.preview ??
-      "Use this session to revise artifacts, inspect files, or shape the next workflow step.",
+      (titleSource === "pending_first_message"
+        ? "Send the first message to title this session automatically, then rename it anytime."
+        : "Use this session to revise artifacts, inspect files, or shape the next workflow step."),
+    selectedModel: null,
+    selectedAgentId: "auto",
     createdAt: now,
     updatedAt: now
   }
@@ -575,10 +927,10 @@ const getDefaultSessionSeed = (project: ProjectRecord) => {
   }
 
   return {
-    title: "Project setup",
-    kind: "setup" as const,
-    summary: "Define the local workspace and start the shared SDLC flow.",
-    preview: "Clarify goals, roles, and the first artifact before Architecture begins."
+    title: "Discovery",
+    kind: "discovery" as const,
+    summary: "Gather requirements, clarify scope, and prepare the first reviewable artifact.",
+    preview: "Start Discovery by clarifying the problem, the users, and the must-have features."
   }
 }
 
@@ -636,7 +988,8 @@ const buildSeedMessages = (
   session: SessionRecord
 ): SessionMessageRecord[] => {
   const now = new Date().toISOString()
-  const activePhase = getActiveOrFocusedPhase(workflow)
+  const selectedAgentPhase = getSelectedAgentPhase(session, workflow)
+  const phaseArtifact = selectedAgentPhase ? phaseArtifactMap[selectedAgentPhase.id] : null
   const kickoffBody =
     project.workflowMode === "analyze_existing"
       ? "Import this repo, inspect the existing structure, and tell me the shortest path to a delivery-ready handover."
@@ -649,29 +1002,29 @@ const buildSeedMessages = (
       id: createId(),
       sessionId: session.id,
       role: "system",
-      label: "Workspace context",
-      body: `${project.name} is running in ${workflowModeLabels[project.workflowMode]} against ${projectTypeLabels[project.projectType].toLowerCase()}. Files live under ${project.workspacePath}.`,
-      chips: [workflowModeLabels[project.workflowMode], projectTypeLabels[project.projectType]],
+      label: "Workspace",
+      body: `Attached to ${project.workspacePath}.`,
+      chips: [],
       createdAt: now
     },
     {
       id: createId(),
       sessionId: session.id,
       role: "user",
-      label: session.title,
+      label: "You",
       body: kickoffBody,
-      chips: activePhase ? [activePhase.name] : [],
+      chips: [],
       createdAt: now
     },
     {
       id: createId(),
       sessionId: session.id,
       role: "assistant",
-      label: "Workspace",
-      body: activePhase
-        ? `This session is anchored to ${activePhase.name}. I’ll keep the chat, files, and review state aligned around ${phaseArtifactMap[activePhase.id]}.`
-        : "This session is anchored to the shared workspace. I’ll keep chat and artifacts aligned.",
-      chips: activePhase ? [phaseArtifactMap[activePhase.id]] : [],
+      label: getSelectedAgentLabel(session, workflow),
+      body: phaseArtifact
+        ? `${phaseArtifact} stays linked to this session.`
+        : "I’ll keep this session aligned with the shared workspace.",
+      chips: [],
       createdAt: now
     }
   ]
@@ -903,6 +1256,70 @@ const getPhasePrimaryArtifactPath = (workflow: WorkflowState | null, phaseId: st
   )
 }
 
+const getPhaseRowDetail = (phase: WorkflowPhase, workflow: WorkflowState | null) => {
+  if (workflow?.pendingHandoff?.fromPhaseId === phase.id) {
+    return `Next: ${
+      phaseDefinitions.find((item) => item.id === workflow.pendingHandoff?.toPhaseId)?.name ?? "Next"
+    }`
+  }
+
+  if (phase.status === "approved" && getPhasePrimaryArtifactPath(workflow, phase.id)) {
+    return "Artifact ready"
+  }
+
+  return phaseStatusLabels[phase.status]
+}
+
+const getPhaseFocusArtifactLabel = (workflow: WorkflowState | null, phaseId: string) => {
+  const relativePath = getPhasePrimaryArtifactPath(workflow, phaseId)
+
+  if (!relativePath) {
+    return "No primary artifact yet"
+  }
+
+  return relativePath.replace(".project-workflow/", "")
+}
+
+const parseToolCommand = (input: string): { name: string; args: string[] } | null => {
+  if (!input.startsWith("/")) {
+    return null
+  }
+
+  const tokens = input
+    .slice(1)
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean)
+
+  if (tokens.length === 0) {
+    return null
+  }
+
+  return {
+    name: tokens[0].toLowerCase(),
+    args: tokens.slice(1)
+  }
+}
+
+const findPhaseInWorkflow = (workflow: WorkflowState | null, token?: string | null) => {
+  if (!workflow) {
+    return null
+  }
+
+  if (!token) {
+    return getActiveOrFocusedPhase(workflow)
+  }
+
+  const normalized = token.trim().toLowerCase()
+
+  return (
+    workflow.phases.find((phase) => phase.id === normalized) ??
+    workflow.phases.find((phase) => phase.name.toLowerCase() === normalized) ??
+    workflow.phases.find((phase) => phase.name.toLowerCase().startsWith(normalized)) ??
+    null
+  )
+}
+
 const getBridge = (): DesktopBridge => window.desktopBridge ?? fallbackBridge
 
 const fallbackBridge: DesktopBridge = {
@@ -934,7 +1351,8 @@ const fallbackBridge: DesktopBridge = {
       kind: seed.kind,
       summary: seed.summary,
       preview: seed.preview,
-      status: "active"
+      status: "active",
+      titleSource: "seeded"
     })
 
     store.projects = [project, ...store.projects]
@@ -962,7 +1380,10 @@ const fallbackBridge: DesktopBridge = {
       throw new Error("Project not found")
     }
 
-    const nextSession = buildSessionRecord(project, title.trim() || "New session")
+    const trimmedTitle = title?.trim() ?? ""
+    const nextSession = buildSessionRecord(project, trimmedTitle || pendingSessionTitle, {
+      titleSource: trimmedTitle ? "manual" : "pending_first_message"
+    })
 
     store.sessions = store.sessions
       .map((session) =>
@@ -1028,6 +1449,7 @@ const fallbackBridge: DesktopBridge = {
         ? {
             ...session,
             title: trimmedTitle,
+            titleSource: "manual",
             updatedAt: new Date().toISOString()
           }
         : session
@@ -1095,7 +1517,158 @@ const fallbackBridge: DesktopBridge = {
     const workflow = store.workflows[projectId]
     const existingMessages = ensureBrowserSessionMessages(store, project, session)
     const activePhase = getActiveOrFocusedPhase(workflow)
+    const selectedAgentPhase = getSelectedAgentPhase(session, workflow)
+    const selectedAgentLabel = getSelectedAgentLabel(session, workflow)
     const now = new Date().toISOString()
+    const toolCommand = parseToolCommand(trimmedBody)
+
+    if (toolCommand) {
+      const userMessage: SessionMessageRecord = {
+        id: createId(),
+        sessionId,
+        role: "user",
+        label: "You",
+        body: trimmedBody,
+        chips: [],
+        createdAt: now
+      }
+
+      let assistantBody = ""
+      let uiAction: SendSessionMessageResult["uiAction"] = null
+
+      if (toolCommand.name === "sdlc_start") {
+        const nextNow = new Date().toISOString()
+        workflow.activePhaseId = "discovery"
+        workflow.phases = workflow.phases.map((phase, index) => ({
+          ...phase,
+          status: index === 0 ? "running" : "not_started",
+          lastUpdatedAt: nextNow
+        }))
+        ensureBrowserWorkflowArtifacts(store, project)
+        assistantBody =
+          "SDLC workflow reset to Discovery. Review the requirements artifact and continue from the Discovery session."
+        uiAction = {
+          type: "open_file",
+          relativePath: getPhasePrimaryArtifactPath(workflow, "discovery") ?? getPhaseArtifactRelativePath("discovery"),
+          targetTab: "files"
+        }
+      } else if (toolCommand.name === "phase_approve") {
+        const phase = findPhaseInWorkflow(workflow, toolCommand.args[0])
+        if (!phase) {
+          throw new Error("Phase not found")
+        }
+        const phaseIndex = workflow.phases.findIndex((item) => item.id === phase.id)
+        const nextNow = new Date().toISOString()
+        workflow.phases = workflow.phases.map((item, index) =>
+          index === phaseIndex ? { ...item, status: "approved", lastUpdatedAt: nextNow } : item
+        )
+        const nextPhase = workflow.phases[phaseIndex + 1] ?? null
+        workflow.activePhaseId = nextPhase?.id ?? null
+        if (nextPhase && nextPhase.status === "not_started") {
+          workflow.phases = workflow.phases.map((item, index) =>
+            index === phaseIndex + 1 ? { ...item, status: "running", lastUpdatedAt: nextNow } : item
+          )
+        }
+        assistantBody = `${phase.name} approved. ${findPhaseInWorkflow(workflow, workflow.activePhaseId)?.name ?? "Next phase"} is now active.`
+      } else if (toolCommand.name === "phase_request_changes") {
+        const phase = findPhaseInWorkflow(workflow, toolCommand.args[0])
+        if (!phase) {
+          throw new Error("Phase not found")
+        }
+        workflow.phases = workflow.phases.map((item) =>
+          item.id === phase.id ? { ...item, status: "changes_requested", lastUpdatedAt: now } : item
+        )
+        workflow.activePhaseId = phase.id
+        assistantBody = `${phase.name} marked as changes requested.`
+      } else if (toolCommand.name === "phase_exit_to_next") {
+        const phase = findPhaseInWorkflow(workflow, toolCommand.args[0])
+        if (!phase) {
+          throw new Error("Phase not found")
+        }
+        workflow.phases = workflow.phases.map((item) =>
+          item.id === phase.id ? { ...item, status: "review_ready", lastUpdatedAt: now } : item
+        )
+        workflow.activePhaseId = phase.id
+        assistantBody = `${phase.name} is now review ready. Open its primary artifact and approve or request changes from the SDLC panel.`
+        uiAction = {
+          type: "open_file",
+          relativePath: getPhasePrimaryArtifactPath(workflow, phase.id) ?? getPhaseArtifactRelativePath(phase.id),
+          targetTab: "files"
+        }
+      } else if (toolCommand.name === "artifact_list") {
+        const phase = findPhaseInWorkflow(workflow, toolCommand.args[0])
+        const artifacts = phase
+          ? workflow.artifacts.filter((artifact) => artifact.phaseId === phase.id)
+          : workflow.artifacts
+        assistantBody =
+          artifacts.length > 0
+            ? `Artifacts${phase ? ` for ${phase.name}` : ""}:\n${artifacts.map((artifact) => `- ${artifact.path}`).join("\n")}`
+            : `No artifacts found${phase ? ` for ${phase.name}` : ""}.`
+      } else if (toolCommand.name === "artifact_open") {
+        const token = toolCommand.args.join(" ").trim()
+        if (!token) {
+          throw new Error("Provide a phase name or relative artifact path")
+        }
+        const phase = findPhaseInWorkflow(workflow, token)
+        const relativePath =
+          phase
+            ? getPhasePrimaryArtifactPath(workflow, phase.id) ?? getPhaseArtifactRelativePath(phase.id)
+            : token.replace(/^\/+/, "")
+        assistantBody = `Opened ${relativePath}. Use the Files tab to inspect it in the workspace.`
+        uiAction = {
+          type: "open_file",
+          relativePath,
+          targetTab: "files"
+        }
+      } else {
+        throw new Error(
+          "Unknown tool. Available commands: /sdlc_start, /phase_approve, /phase_request_changes, /phase_exit_to_next, /artifact_list, /artifact_open"
+        )
+      }
+
+      const assistantMessage: SessionMessageRecord = {
+        id: createId(),
+        sessionId,
+        role: "assistant",
+        label: "SDLC Tool",
+        body: assistantBody,
+        chips: [],
+        createdAt: new Date(Date.now() + 1).toISOString()
+      }
+
+      store.sessionMessages = [...store.sessionMessages, userMessage, assistantMessage]
+      store.sessions = store.sessions.map((item) =>
+        item.projectId !== projectId
+          ? item
+          : item.id === sessionId
+            ? {
+                ...item,
+                title:
+                  item.titleSource === "pending_first_message"
+                    ? deriveSessionTitleFromMessage(trimmedBody)
+                    : item.title,
+                titleSource:
+                  item.titleSource === "pending_first_message" ? "message" : item.titleSource,
+                status: "active",
+                preview: assistantBody.slice(0, 160),
+                summary: `${findPhaseInWorkflow(workflow, workflow.activePhaseId)?.name ?? "Workflow"} session`,
+                updatedAt: now
+              }
+            : item.status === "active"
+              ? { ...item, status: "idle" }
+              : item
+      )
+      store.activeSessionIdByProject[projectId] = sessionId
+      store.workflows[projectId] = workflow
+      ensureBrowserWorkflowArtifacts(store, project)
+      writeBrowserStore(store)
+
+      return {
+        dashboard: buildDashboardData(store),
+        messages: [...existingMessages, userMessage, assistantMessage],
+        uiAction
+      }
+    }
 
     const userMessage: SessionMessageRecord = {
       id: createId(),
@@ -1103,18 +1676,18 @@ const fallbackBridge: DesktopBridge = {
       role: "user",
       label: "You",
       body: trimmedBody,
-      chips: activePhase ? [activePhase.name] : [],
+      chips: [],
       createdAt: now
     }
     const assistantMessage: SessionMessageRecord = {
       id: createId(),
       sessionId,
       role: "assistant",
-      label: "Workspace",
-      body: activePhase
-        ? `Saved to this session. I’m keeping ${activePhase.name} centered around ${phaseArtifactMap[activePhase.id]}.`
-        : "Saved to this session. I’m keeping the workspace context aligned.",
-      chips: activePhase ? [phaseArtifactMap[activePhase.id]] : [],
+      label: selectedAgentLabel,
+      body: selectedAgentPhase
+        ? `Saved. ${phaseArtifactMap[selectedAgentPhase.id]} stays linked to this session.`
+        : "Saved to this session.",
+      chips: [],
       createdAt: new Date(Date.now() + 1).toISOString()
     }
 
@@ -1125,11 +1698,17 @@ const fallbackBridge: DesktopBridge = {
         : item.id === sessionId
           ? {
               ...item,
+              title:
+                item.titleSource === "pending_first_message"
+                  ? deriveSessionTitleFromMessage(trimmedBody)
+                  : item.title,
+              titleSource:
+                item.titleSource === "pending_first_message" ? "message" : item.titleSource,
               status: "active",
               preview: trimmedBody.slice(0, 160),
-              summary: activePhase
-                ? `${activePhase.name} discussion updated in this session.`
-                : "Project discussion updated in this session.",
+              summary: selectedAgentLabel
+                ? `${selectedAgentLabel} session`
+                : "Project session",
               updatedAt: now
             }
           : item.status === "active"
@@ -1141,9 +1720,35 @@ const fallbackBridge: DesktopBridge = {
 
     return {
       dashboard: buildDashboardData(store),
-      messages: [...existingMessages, userMessage, assistantMessage]
+      messages: [...existingMessages, userMessage, assistantMessage],
+      uiAction: null
     }
   },
+  updateSessionPreferences: async ({
+    projectId,
+    sessionId,
+    selectedModel,
+    selectedAgentId
+  }) => {
+    const store = readBrowserStore()
+    const nextSelectedModel = selectedModel?.trim() || null
+    const nextSelectedAgentId = selectedAgentId ?? "auto"
+
+    store.sessions = store.sessions.map((session) =>
+      session.id === sessionId && session.projectId === projectId
+        ? {
+            ...session,
+            selectedModel: nextSelectedModel,
+            selectedAgentId: nextSelectedAgentId,
+            updatedAt: new Date().toISOString()
+          }
+        : session
+    )
+    writeBrowserStore(store)
+    return buildDashboardData(store)
+  },
+  interruptSession: async () => false,
+  onCodexEvent: () => () => {},
   listWorkspaceEntries: async ({ projectId, scope }) => {
     const store = readBrowserStore()
     const project = store.projects.find((item) => item.id === projectId)
@@ -1251,7 +1856,24 @@ const fallbackBridge: DesktopBridge = {
 function App() {
   const isElectronRuntime =
     window.__CODEX_BUILDATHON__?.runtime === "electron" || Boolean(window.desktopBridge)
+  const workspaceLayoutRef = useRef<HTMLElement | null>(null)
   const hoverResetTimeoutRef = useRef<number | null>(null)
+  const promptFormRef = useRef<HTMLFormElement | null>(null)
+  const promptInputRef = useRef<HTMLTextAreaElement | null>(null)
+  const paneDragStateRef = useRef<
+    | {
+        type: "workspace"
+        startX: number
+        centerWidth: number
+        reviewSidebarWidth: number
+      }
+    | {
+        type: "inspector"
+        startX: number
+        reviewSidebarWidth: number
+      }
+    | null
+  >(null)
   const [shellInfo, setShellInfo] = useState<ShellInfo | null>(null)
   const [dashboard, setDashboard] = useState<DashboardData>(emptyDashboard)
   const [entryForm, setEntryForm] = useState<EntryFormState>(initialEntryForm)
@@ -1270,9 +1892,9 @@ function App() {
   const [editingSession, setEditingSession] = useState<{ sessionId: string; title: string } | null>(
     null
   )
-  const [sessionDraft, setSessionDraft] = useState({ title: "" })
   const [promptDraft, setPromptDraft] = useState("")
   const [sessionMessages, setSessionMessages] = useState<SessionMessageRecord[]>([])
+  const [liveTurn, setLiveTurn] = useState<LiveTurnState | null>(null)
   const [reviewEntries, setReviewEntries] = useState<WorkspaceEntry[]>([])
   const [fileEntries, setFileEntries] = useState<WorkspaceEntry[]>([])
   const [fileCache, setFileCache] = useState<Record<string, WorkspaceFileContent>>({})
@@ -1283,6 +1905,121 @@ function App() {
   const [isWorkspaceLoading, setIsWorkspaceLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
+  const getWorkspaceMetrics = useCallback(() => {
+    const shell = workspaceLayoutRef.current
+
+    if (!shell) {
+      return null
+    }
+
+    const styles = window.getComputedStyle(shell)
+    const gap = Number.parseFloat(styles.columnGap || styles.gap || "14") || 14
+
+    return {
+      width: shell.clientWidth,
+      gap
+    }
+  }, [])
+
+  const clampWorkspaceWidths = useCallback(
+    (nextCenterWidth: number, nextSidebarWidth: number, currentLayout: WorkspaceLayoutState) => {
+      const metrics = getWorkspaceMetrics()
+
+      if (!metrics || !currentLayout.inspectorOpen) {
+        return clampLayout({
+          ...currentLayout,
+          centerWidth: nextCenterWidth,
+          reviewSidebarWidth: nextSidebarWidth
+        })
+      }
+
+      const showInspectorMain = getShouldShowInspectorMain(currentLayout)
+      const availableWidth = Math.max(0, metrics.width - metrics.gap * 2 - paneResizerWidth)
+
+      if (!showInspectorMain) {
+        const maxCenterWidth = Math.max(
+          workspaceMinCenterWidth,
+          availableWidth - inspectorMinSidebarWidth
+        )
+        const centerWidth = Math.max(
+          workspaceMinCenterWidth,
+          Math.min(maxCenterWidth, nextCenterWidth)
+        )
+        const sidebarWidth = Math.max(
+          inspectorMinSidebarWidth,
+          Math.min(inspectorMaxSidebarWidth, availableWidth - centerWidth)
+        )
+
+        return clampLayout({
+          ...currentLayout,
+          centerWidth,
+          reviewSidebarWidth: sidebarWidth
+        })
+      }
+
+      const minInspectorShellWidth = inspectorMinMainWidth + paneResizerWidth + inspectorMinSidebarWidth
+      const maxCenterWidth = Math.max(
+        workspaceMinCenterWidth,
+        availableWidth - minInspectorShellWidth
+      )
+      const centerWidth = Math.max(
+        workspaceMinCenterWidth,
+        Math.min(maxCenterWidth, nextCenterWidth)
+      )
+      const inspectorShellWidth = Math.max(
+        minInspectorShellWidth,
+        availableWidth - centerWidth
+      )
+      const maxSidebarWidth = Math.max(
+        inspectorMinSidebarWidth,
+        Math.min(inspectorMaxSidebarWidth, inspectorShellWidth - paneResizerWidth - inspectorMinMainWidth)
+      )
+      const reviewSidebarWidth = Math.max(
+        inspectorMinSidebarWidth,
+        Math.min(maxSidebarWidth, nextSidebarWidth)
+      )
+      const inspectorWidth = inspectorShellWidth - paneResizerWidth - reviewSidebarWidth
+
+      return clampLayout({
+        ...currentLayout,
+        centerWidth,
+        inspectorWidth,
+        reviewSidebarWidth
+      })
+    },
+    [getWorkspaceMetrics]
+  )
+
+  const clampInspectorSidebarWidth = useCallback(
+    (nextSidebarWidth: number, currentLayout: WorkspaceLayoutState) => {
+      const metrics = getWorkspaceMetrics()
+
+      if (!metrics || !currentLayout.inspectorOpen || !getShouldShowInspectorMain(currentLayout)) {
+        return clampLayout({
+          ...currentLayout,
+          reviewSidebarWidth: nextSidebarWidth
+        })
+      }
+
+      const inspectorShellWidth = currentLayout.inspectorWidth + paneResizerWidth + currentLayout.reviewSidebarWidth
+      const maxSidebarWidth = Math.max(
+        inspectorMinSidebarWidth,
+        Math.min(inspectorMaxSidebarWidth, inspectorShellWidth - paneResizerWidth - inspectorMinMainWidth)
+      )
+      const reviewSidebarWidth = Math.max(
+        inspectorMinSidebarWidth,
+        Math.min(maxSidebarWidth, nextSidebarWidth)
+      )
+
+      return clampLayout({
+        ...currentLayout,
+        reviewSidebarWidth,
+        inspectorWidth: inspectorShellWidth - paneResizerWidth - reviewSidebarWidth
+      })
+    },
+    [getWorkspaceMetrics]
+  )
+
   const patchLayout = (
     nextValue:
       | Partial<WorkspaceLayoutState>
@@ -1291,6 +2028,41 @@ function App() {
     setLayout((current) =>
       clampLayout(typeof nextValue === "function" ? nextValue(current) : { ...current, ...nextValue })
     )
+  }
+
+  const startWorkspaceResize = (event: ReactMouseEvent<HTMLDivElement>) => {
+    event.preventDefault()
+    paneDragStateRef.current = {
+      type: "workspace",
+      startX: event.clientX,
+      centerWidth: layout.centerWidth,
+      reviewSidebarWidth: layout.reviewSidebarWidth
+    }
+    document.body.classList.add("is-resizing")
+  }
+
+  const startInspectorResize = (event: ReactMouseEvent<HTMLDivElement>) => {
+    event.preventDefault()
+    paneDragStateRef.current = {
+      type: "inspector",
+      startX: event.clientX,
+      reviewSidebarWidth: layout.reviewSidebarWidth
+    }
+    document.body.classList.add("is-resizing")
+  }
+
+  const handleComposerKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
+    if (event.key !== "Enter" || event.shiftKey || event.nativeEvent.isComposing) {
+      return
+    }
+
+    event.preventDefault()
+
+    if (!promptDraft.trim() || isSendingMessage) {
+      return
+    }
+
+    promptFormRef.current?.requestSubmit()
   }
 
   const refreshDashboard = async () => {
@@ -1364,12 +2136,153 @@ function App() {
   }, [layout])
 
   useEffect(() => {
+    if (!window.desktopBridge?.onCodexEvent) {
+      return
+    }
+
+    return window.desktopBridge.onCodexEvent((event) => {
+      setLiveTurn((current) => {
+        if (
+          !current ||
+          current.projectId !== event.projectId ||
+          current.sessionId !== event.sessionId
+        ) {
+          return current
+        }
+
+        if (event.type === "assistant_delta") {
+          return {
+            ...current,
+            assistantText: `${current.assistantText}${event.delta}`
+          }
+        }
+
+        if (event.type === "turn_started") {
+          return {
+            ...current,
+            started: true
+          }
+        }
+
+        if (
+          event.type === "command_started" ||
+          event.type === "command_output" ||
+          event.type === "command_completed" ||
+          event.type === "file_change" ||
+          event.type === "tool_started" ||
+          event.type === "tool_completed" ||
+          event.type === "interrupted" ||
+          event.type === "error"
+        ) {
+          return current
+        }
+
+        if (event.type === "turn_completed") {
+          return {
+            ...current,
+            started: true
+          }
+        }
+
+        return current
+      })
+    })
+  }, [])
+
+  useEffect(() => {
     return () => {
       if (hoverResetTimeoutRef.current !== null) {
         window.clearTimeout(hoverResetTimeoutRef.current)
       }
     }
   }, [])
+
+  useEffect(() => {
+    const textarea = promptInputRef.current
+
+    if (!textarea) {
+      return
+    }
+
+    textarea.style.height = "0px"
+    textarea.style.height = `${Math.min(220, Math.max(56, textarea.scrollHeight))}px`
+  }, [promptDraft])
+
+  useEffect(() => {
+    const handleMouseMove = (event: MouseEvent) => {
+      const dragState = paneDragStateRef.current
+
+      if (!dragState) {
+        return
+      }
+
+      if (dragState.type === "workspace") {
+        const delta = event.clientX - dragState.startX
+        setLayout((current) =>
+          clampWorkspaceWidths(
+            dragState.centerWidth + delta,
+            dragState.reviewSidebarWidth,
+            current
+          )
+        )
+        return
+      }
+
+      setLayout((current) => clampInspectorSidebarWidth(
+        dragState.reviewSidebarWidth - (event.clientX - dragState.startX),
+        current
+      ))
+    }
+
+    const handleMouseUp = () => {
+      if (!paneDragStateRef.current) {
+        return
+      }
+
+      paneDragStateRef.current = null
+      document.body.classList.remove("is-resizing")
+    }
+
+    window.addEventListener("mousemove", handleMouseMove)
+    window.addEventListener("mouseup", handleMouseUp)
+
+    return () => {
+      window.removeEventListener("mousemove", handleMouseMove)
+      window.removeEventListener("mouseup", handleMouseUp)
+    }
+  }, [clampInspectorSidebarWidth, clampWorkspaceWidths])
+
+  useEffect(() => {
+    const handleResize = () => {
+      setLayout((current) => clampWorkspaceWidths(current.centerWidth, current.reviewSidebarWidth, current))
+    }
+
+    window.addEventListener("resize", handleResize)
+    handleResize()
+
+    return () => {
+      window.removeEventListener("resize", handleResize)
+    }
+  }, [clampWorkspaceWidths])
+
+  const resetWorkspaceWidths = () => {
+    setLayout((current) =>
+      clampWorkspaceWidths(
+        defaultWorkspaceLayout.centerWidth,
+        defaultWorkspaceLayout.reviewSidebarWidth,
+        current
+      )
+    )
+  }
+
+  const resetInspectorWidths = () => {
+    setLayout((current) =>
+      clampWorkspaceWidths(current.centerWidth, defaultWorkspaceLayout.reviewSidebarWidth, {
+        ...current,
+        inspectorWidth: defaultWorkspaceLayout.inspectorWidth
+      })
+    )
+  }
 
   useEffect(() => {
     if (layout.sidebarOpen) {
@@ -1382,6 +2295,7 @@ function App() {
       selectedReviewFile: null,
       openedSdlcArtifactPath: null
     })
+    setLiveTurn(null)
   }, [dashboard.activeProject?.id, dashboard.activeSession?.id])
 
   useEffect(() => {
@@ -1495,26 +2409,6 @@ function App() {
     }
   }, [dashboard.activeProject?.id, layout.activeFileTab])
 
-  const selectedSdlcArtifactPath = getPhasePrimaryArtifactPath(
-    dashboard.workflow,
-    layout.selectedSdlcPhase
-  )
-
-  useEffect(() => {
-    if (
-      dashboard.activeProject &&
-      layout.openedSdlcArtifactPath &&
-      selectedSdlcArtifactPath &&
-      layout.openedSdlcArtifactPath === selectedSdlcArtifactPath
-    ) {
-      void ensureWorkspaceFile(dashboard.activeProject.id, selectedSdlcArtifactPath).catch(
-        (loadError) => {
-          setError(loadError instanceof Error ? loadError.message : "Unable to open SDLC artifact")
-        }
-      )
-    }
-  }, [dashboard.activeProject?.id, selectedSdlcArtifactPath, layout.openedSdlcArtifactPath])
-
   const handleCreateProject = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault()
     const bridge = getBridge()
@@ -1582,30 +2476,23 @@ function App() {
     }, 180)
   }
 
-  const handleCreateSession = async (projectId: string, title: string) => {
+  const handleCreateSession = async (projectId: string) => {
     const bridge = getBridge()
-    const trimmedTitle = title.trim()
-
-    if (!trimmedTitle) {
-      setError("Session title is required")
-      return
-    }
 
     setIsCreatingSession(true)
     setError(null)
 
     try {
-      const nextDashboard = await bridge.createSession({
-        projectId,
-        title: trimmedTitle
-      })
+      const nextDashboard = await bridge.createSession({ projectId })
 
       startTransition(() => {
         setDashboard(nextDashboard)
-        setSessionDraft({ title: "" })
         setSidebarProjectId(projectId)
         setHoverProjectId(null)
         setShellSurface("workspace")
+      })
+      window.requestAnimationFrame(() => {
+        promptInputRef.current?.focus()
       })
     } catch (sessionError) {
       setError(sessionError instanceof Error ? sessionError.message : "Unable to create session")
@@ -1785,6 +2672,27 @@ function App() {
     setIsSendingMessage(true)
     setError(null)
 
+    const optimisticUserMessage: SessionMessageRecord = {
+      id: `optimistic-${Date.now()}`,
+      sessionId: activeSession.id,
+      role: "user",
+      label: "You",
+      body: trimmedPrompt,
+      chips: [],
+      createdAt: new Date().toISOString()
+    }
+
+    startTransition(() => {
+      setSessionMessages((current) => [...current, optimisticUserMessage])
+      setPromptDraft("")
+      setLiveTurn({
+        projectId: activeProject.id,
+        sessionId: activeSession.id,
+        assistantText: "",
+        started: false
+      })
+    })
+
     try {
       const result = await bridge.sendSessionMessage({
         projectId: activeProject.id,
@@ -1795,12 +2703,109 @@ function App() {
       startTransition(() => {
         setDashboard(result.dashboard)
         setSessionMessages(result.messages)
-        setPromptDraft("")
+        setLiveTurn(null)
       })
+
+      if (result.uiAction?.type === "open_file") {
+        void openFileInInspector(result.uiAction.relativePath, result.uiAction.targetTab)
+      }
     } catch (messageError) {
       setError(messageError instanceof Error ? messageError.message : "Unable to send message")
+      setSessionMessages((current) =>
+        current.filter((message) => message.id !== optimisticUserMessage.id)
+      )
+      setLiveTurn(null)
     } finally {
       setIsSendingMessage(false)
+    }
+  }
+
+  const handleInterruptSession = async () => {
+    const activeProject = dashboard.activeProject
+    const activeSession = dashboard.activeSession
+
+    if (!activeProject || !activeSession) {
+      return
+    }
+
+    try {
+      await getBridge().interruptSession({
+        projectId: activeProject.id,
+        sessionId: activeSession.id
+      })
+    } catch (interruptError) {
+      setError(interruptError instanceof Error ? interruptError.message : "Unable to interrupt turn")
+    }
+  }
+
+  const handleSessionPreferenceChange = async (payload: {
+    selectedModel?: string | null
+    selectedAgentId?: SessionAgentId
+  }) => {
+    const activeProject = dashboard.activeProject
+    const activeSession = dashboard.activeSession
+
+    if (!activeProject || !activeSession) {
+      return
+    }
+
+    setError(null)
+
+    const optimisticSession: SessionRecord = {
+      ...activeSession,
+      selectedModel:
+        payload.selectedModel === undefined ? activeSession.selectedModel : payload.selectedModel ?? null,
+      selectedAgentId: payload.selectedAgentId ?? activeSession.selectedAgentId,
+      updatedAt: new Date().toISOString()
+    }
+
+    const nextSelectedSdlcPhase = phaseDefinitions.some(
+      (phase) => phase.id === optimisticSession.selectedAgentId
+    )
+      ? optimisticSession.selectedAgentId
+      : getActiveOrFocusedPhase(dashboard.workflow)?.id ?? null
+
+    startTransition(() => {
+      setDashboard((current) => ({
+        ...current,
+        sessions: current.sessions.map((session) =>
+          session.id === optimisticSession.id ? optimisticSession : session
+        ),
+        activeSession: optimisticSession,
+        allSessions: current.allSessions.map((session) =>
+          session.id === optimisticSession.id ? optimisticSession : session
+        )
+      }))
+      patchLayout({
+        selectedSdlcPhase: nextSelectedSdlcPhase,
+        openedSdlcArtifactPath: null
+      })
+    })
+
+    try {
+      const nextDashboard = await getBridge().updateSessionPreferences({
+        projectId: activeProject.id,
+        sessionId: activeSession.id,
+        ...payload
+      })
+
+      startTransition(() => {
+        setDashboard(nextDashboard)
+        patchLayout({
+          selectedSdlcPhase: phaseDefinitions.some(
+            (phase) => phase.id === (payload.selectedAgentId ?? nextDashboard.activeSession?.selectedAgentId)
+          )
+            ? ((payload.selectedAgentId ?? nextDashboard.activeSession?.selectedAgentId) as string)
+            : getActiveOrFocusedPhase(nextDashboard.workflow)?.id ?? null,
+          openedSdlcArtifactPath: null
+        })
+      })
+    } catch (preferenceError) {
+      setError(
+        preferenceError instanceof Error
+          ? preferenceError.message
+          : "Unable to update chat preferences"
+      )
     }
   }
 
@@ -1842,36 +2847,6 @@ function App() {
     }
   }
 
-  const handleOpenSdlcArtifact = async (relativePath: string, targetTab: "sdlc" | "review" | "files") => {
-    const activeProject = dashboard.activeProject
-
-    if (!activeProject) {
-      return
-    }
-
-    setError(null)
-
-    try {
-      await ensureWorkspaceFile(activeProject.id, relativePath)
-      patchLayout((current) => ({
-        ...current,
-        inspectorOpen: true,
-        inspectorTab: targetTab === "sdlc" ? "sdlc" : targetTab,
-        selectedReviewFile: targetTab === "review" ? relativePath : current.selectedReviewFile,
-        openedFileTabs:
-          targetTab === "files"
-            ? current.openedFileTabs.includes(relativePath)
-              ? current.openedFileTabs
-              : [...current.openedFileTabs, relativePath]
-            : current.openedFileTabs,
-        activeFileTab: targetTab === "files" ? relativePath : current.activeFileTab,
-        openedSdlcArtifactPath: relativePath
-      }))
-    } catch (fileError) {
-      setError(fileError instanceof Error ? fileError.message : "Unable to open SDLC artifact")
-    }
-  }
-
   const closeFileTab = (relativePath: string) => {
     patchLayout((current) => {
       const nextOpenedTabs = current.openedFileTabs.filter((tab) => tab !== relativePath)
@@ -1906,7 +2881,24 @@ function App() {
   const workflow = dashboard.workflow
   const activeSession = dashboard.activeSession
   const activePhase = getActiveOrFocusedPhase(workflow)
-  const currentPhaseActions = phaseActions(activePhase)
+  const activeChatAgent = getSelectedAgentPhase(activeSession, workflow)
+  const activeChatAgentLabel = getSelectedAgentLabel(activeSession, workflow)
+  const headerPhase =
+    activeChatAgent && activePhase && activeChatAgent.id !== activePhase.id
+      ? null
+      : activeChatAgent ?? activePhase ?? null
+  const activeArtifactName = activeChatAgent
+    ? phaseArtifactMap[activeChatAgent.id]
+    : activePhase
+      ? phaseArtifactMap[activePhase.id]
+      : null
+  const activeProjectSessions = activeProject
+    ? dashboard.allSessions
+        .filter((session) => session.projectId === activeProject.id && session.status !== "archived")
+        .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))
+    : []
+  const workspaceTitle = activeSession?.title ?? activeProject?.name ?? "Workspace"
+  const workspaceSubtitle = [activeProject?.name, activePhase?.name].filter(Boolean).join(" · ")
   const selectedEntryCard = entryCards.find((card) => card.projectType === entryForm.projectType)
   const sidebarProject =
     dashboard.projects.find((project) => project.id === sidebarProjectId) ?? activeProject ?? null
@@ -1934,14 +2926,19 @@ function App() {
       : null
   const selectedSdlcPhase =
     workflow?.phases.find((phase) => phase.id === layout.selectedSdlcPhase) ?? activePhase ?? null
-  const sdlcArtifactContent =
-    activeProject &&
-    selectedSdlcArtifactPath &&
-    layout.openedSdlcArtifactPath === selectedSdlcArtifactPath
-      ? fileCache[getCacheKey(activeProject.id, selectedSdlcArtifactPath)] ?? null
+  const selectedSdlcHandoff =
+    workflow?.pendingHandoff &&
+    selectedSdlcPhase &&
+    workflow.pendingHandoff.fromPhaseId === selectedSdlcPhase.id
+      ? workflow.pendingHandoff
       : null
   const reviewTabLabel = reviewFilePaths.length === 1 ? "1 Change" : `${reviewFilePaths.length} Changes`
   const fileTabLabel = allFilePaths.length === 1 ? "1 File" : "All files"
+  const selectedSdlcArtifactPath = getPhasePrimaryArtifactPath(
+    dashboard.workflow,
+    layout.selectedSdlcPhase
+  )
+  const shouldShowInspectorMain = getShouldShowInspectorMain(layout)
 
   const renderFileBody = (
     content: WorkspaceFileContent | null,
@@ -1984,6 +2981,31 @@ function App() {
       )
     }
 
+    if (content.kind === "image") {
+      return (
+        <div className="document-surface">
+          <div className="document-header">
+            <div>
+              <p className="section-label">Open file</p>
+              <h3>{content.name}</h3>
+            </div>
+            <span className="pill">image</span>
+          </div>
+          <p className="document-path">{content.path}</p>
+          {content.dataUrl ? (
+            <div className="document-image-frame">
+              <img src={content.dataUrl} alt={content.name} className="document-image" />
+            </div>
+          ) : (
+            <div className="inspector-empty">
+              <strong>Image unavailable</strong>
+              <p>The image file could not be rendered.</p>
+            </div>
+          )}
+        </div>
+      )
+    }
+
     return (
       <div className="document-surface">
         <div className="document-header">
@@ -1994,9 +3016,13 @@ function App() {
           <span className="pill">{content.kind}</span>
         </div>
         <p className="document-path">{content.path}</p>
-        <pre className={`document-content document-content-${content.kind}`}>
-          <code>{content.content}</code>
-        </pre>
+        {content.kind === "markdown" ? (
+          <div className="document-content document-content-markdown">{renderMarkdownContent(content.content ?? "")}</div>
+        ) : (
+          <pre className={`document-content document-content-${content.kind}`}>
+            <code>{content.content}</code>
+          </pre>
+        )}
       </div>
     )
   }
@@ -2008,13 +3034,28 @@ function App() {
   ): JSX.Element[] =>
     entries.map((entry) => {
       if (entry.type === "directory") {
+        const isExpanded = layout.expandedDirectories[entry.path] ?? true
+
         return (
           <div key={entry.path} className="tree-group">
-            <div className="tree-directory" style={{ paddingLeft: `${depth * 14}px` }}>
-              <span className="tree-icon">▾</span>
+            <button
+              type="button"
+              className="tree-directory"
+              style={{ paddingLeft: `${depth * 14}px` }}
+              onClick={() =>
+                patchLayout((current) => ({
+                  ...current,
+                  expandedDirectories: {
+                    ...current.expandedDirectories,
+                    [entry.path]: !(current.expandedDirectories[entry.path] ?? true)
+                  }
+                }))
+              }
+            >
+              <span className={`tree-icon ${isExpanded ? "tree-icon-expanded" : ""}`}>▸</span>
               <span>{displayTreeName(entry.name)}</span>
-            </div>
-            {renderWorkspaceTree(entry.children ?? [], mode, depth + 1)}
+            </button>
+            {isExpanded ? renderWorkspaceTree(entry.children ?? [], mode, depth + 1) : null}
           </div>
         )
       }
@@ -2038,7 +3079,7 @@ function App() {
       )
     })
 
-  const renderSidebarSessionItem = (session: SessionRecord, projectId: string) => {
+  const renderSidebarSessionItem = (session: SessionRecord, projectId: string, compact = false) => {
     const isActive =
       session.id === activeSession?.id && projectId === activeProject?.id && shellSurface === "workspace"
     const isEditing = editingSession?.sessionId === session.id
@@ -2081,47 +3122,63 @@ function App() {
           <>
             <button
               type="button"
-              className="sidebar-session-main"
+              className={`sidebar-session-main ${compact ? "sidebar-session-main-compact" : ""}`}
               onClick={() => void handleSelectSession(projectId, session.id)}
             >
               <span className={`session-status-dot session-status-${session.status}`} />
               <div className="sidebar-session-copy">
-                <div className="sidebar-session-title-row">
-                  <strong>{session.title}</strong>
-                  {isActive ? <span className="pill accent">Active</span> : null}
+                <strong className="sidebar-session-title">{session.title}</strong>
+                <div className="sidebar-session-meta-row">
+                  <span className="sidebar-session-meta">{formatDate(session.updatedAt)}</span>
+                  {isActive ? <span className="pill accent sidebar-session-pill">Active</span> : null}
                 </div>
-                <span>{session.summary}</span>
-                <span>{formatDate(session.updatedAt)}</span>
               </div>
             </button>
-            <div className="sidebar-session-actions">
-              <button
-                type="button"
-                className="secondary action-button"
-                onClick={() =>
-                  setEditingSession({
-                    sessionId: session.id,
-                    title: session.title
-                  })
-                }
-              >
-                Rename
-              </button>
-              <button
-                type="button"
-                className="secondary action-button"
-                onClick={() => void handleArchiveSession(projectId, session.id)}
-              >
-                Archive
-              </button>
-              <button
-                type="button"
-                className="secondary action-button action-button-danger"
-                onClick={() => void handleDeleteSession(projectId, session.id)}
-              >
-                Delete
-              </button>
-            </div>
+            {!compact ? (
+              <div className="sidebar-session-actions">
+                <button
+                  type="button"
+                  className="secondary action-button"
+                  onClick={() =>
+                    setEditingSession({
+                      sessionId: session.id,
+                      title: session.title
+                    })
+                  }
+                >
+                  Rename
+                </button>
+                <button
+                  type="button"
+                  className="secondary action-button"
+                  onClick={() => void handleArchiveSession(projectId, session.id)}
+                >
+                  Archive
+                </button>
+                <button
+                  type="button"
+                  className="secondary action-button action-button-danger"
+                  onClick={() => void handleDeleteSession(projectId, session.id)}
+                >
+                  Delete
+                </button>
+              </div>
+            ) : (
+              <div className="sidebar-session-actions sidebar-session-actions-compact">
+                <button
+                  type="button"
+                  className="secondary action-button action-button-compact"
+                  onClick={() =>
+                    setEditingSession({
+                      sessionId: session.id,
+                      title: session.title
+                    })
+                  }
+                >
+                  Rename
+                </button>
+              </div>
+            )}
           </>
         )}
       </div>
@@ -2200,7 +3257,7 @@ function App() {
 
     return (
       <aside
-        className={`project-sidebar card ${floating ? "project-sidebar-floating" : ""}`}
+        className={`project-sidebar card ${floating ? "project-sidebar-floating project-sidebar-compact" : ""}`}
         onMouseEnter={() => clearHoverReset()}
         onMouseLeave={() => scheduleHoverReset()}
       >
@@ -2243,30 +3300,36 @@ function App() {
               ) : (
                 <>
                   <h2 className="sidebar-project-heading">{project.name}</h2>
-                  <p className="sidebar-project-path">{project.workspacePath}</p>
+                  <p className="sidebar-project-path" title={project.workspacePath}>
+                    {floating ? getPathTail(project.workspacePath) : project.workspacePath}
+                  </p>
                 </>
               )}
             </div>
           </div>
           {!isEditingProject ? (
             <div className="sidebar-project-actions">
-              <button
-                type="button"
-                className="secondary action-button"
-                onClick={() => setEditingProject({ projectId: project.id, name: project.name })}
-              >
-                Rename
-              </button>
+              {!floating ? (
+                <button
+                  type="button"
+                  className="secondary action-button"
+                  onClick={() => setEditingProject({ projectId: project.id, name: project.name })}
+                >
+                  Rename
+                </button>
+              ) : null}
               <span className="pill">{workflowModeLabels[project.workflowMode]}</span>
             </div>
           ) : null}
         </div>
 
-        <section className="sidebar-section">
+        <section className="sidebar-section sidebar-session-section">
           <div className="sidebar-section-heading">
-            <div>
-              <p className="section-label">Sessions</p>
-              <strong>{sessions.length} active threads</strong>
+            <div className="sidebar-section-heading-copy">
+              <strong>Sessions</strong>
+              <span className="sidebar-section-caption">
+                {sessions.length} active {sessions.length === 1 ? "thread" : "threads"}
+              </span>
             </div>
             <button
               type="button"
@@ -2285,39 +3348,33 @@ function App() {
           {isWorkspaceSectionOpen ? (
             <>
               <div className="sidebar-project-list">
-                {sessions.map((session) => renderSidebarSessionItem(session, project.id))}
+                {sessions.map((session) => renderSidebarSessionItem(session, project.id, floating))}
               </div>
 
-              <form
-                className="new-session-form"
-                onSubmit={(event) => {
-                  event.preventDefault()
-                  void handleCreateSession(project.id, sessionDraft.title)
-                }}
+              <button
+                type="button"
+                className={`new-session-button ${floating ? "new-session-button-compact" : ""}`}
+                onClick={() => void handleCreateSession(project.id)}
+                disabled={isCreatingSession}
               >
-                <input
-                  value={sessionDraft.title}
-                  onChange={(event) => setSessionDraft({ title: event.target.value })}
-                  placeholder="New session title"
-                />
-                <button type="submit" disabled={isCreatingSession}>
-                  {isCreatingSession ? "…" : "New"}
-                </button>
-              </form>
+                {isCreatingSession ? "Creating..." : "New session"}
+              </button>
             </>
           ) : null}
         </section>
 
         <section className="sidebar-section card-quiet sidebar-project-meta-card">
-          <p className="section-label">Workspace mode</p>
+          <p className="section-label">{floating ? "Mode" : "Workspace mode"}</p>
           <div className="sidebar-meta-grid">
             <div>
               <strong>{projectTypeLabels[project.projectType]}</strong>
-              <span>Workspace root stays fixed through the full journey.</span>
+              {!floating ? <span>Workspace root stays fixed through the full journey.</span> : null}
             </div>
             <div>
               <strong>{workflowModeLabels[project.workflowMode]}</strong>
-              <span>Controls how aggressively the workflow compresses or expands.</span>
+              {!floating ? (
+                <span>Controls how aggressively the workflow compresses or expands.</span>
+              ) : null}
             </div>
           </div>
         </section>
@@ -2328,7 +3385,7 @@ function App() {
   }
 
   const renderSidebar = () => (
-    <aside className={`project-sidebar-shell ${layout.sidebarOpen ? "" : "project-sidebar-shell-collapsed"}`}>
+    <aside className="project-sidebar-shell project-sidebar-shell-collapsed">
       <div className="sidebar-rail card">
         <div className="sidebar-rail-top">
           <button
@@ -2347,6 +3404,17 @@ function App() {
           >
             {layout.sidebarOpen ? "«" : "»"}
           </button>
+          {activeProject && shellSurface === "workspace" ? (
+            <button
+              type="button"
+              className="rail-button"
+              onClick={() => void handleCreateSession(activeProject.id)}
+              title="New session"
+              disabled={isCreatingSession}
+            >
+              +
+            </button>
+          ) : null}
         </div>
 
         <div className="rail-project-stack">
@@ -2387,7 +3455,7 @@ function App() {
             onClick={() => openProjectSetup("new_project")}
             title="New project"
           >
-            +
+            □
           </button>
           <button
             type="button"
@@ -2416,8 +3484,9 @@ function App() {
         </div>
       </div>
 
-      {layout.sidebarOpen ? renderSidebarPanel(visibleSidebarProject) : null}
-      {!layout.sidebarOpen && hoverProjectId ? renderSidebarPanel(visibleSidebarProject, true) : null}
+      {layout.sidebarOpen || (!layout.sidebarOpen && hoverProjectId)
+        ? renderSidebarPanel(visibleSidebarProject, true)
+        : null}
     </aside>
   )
 
@@ -2428,10 +3497,11 @@ function App() {
           <span className="brand-mark">SD</span>
           <span className="eyebrow">Project workspace first</span>
         </div>
-        <h1>Choose a workspace root, then run the entire journey against that folder.</h1>
+        <h1>Build products through a structured AI SDLC workspace.</h1>
         <p className="hero-copy">
-          The left rail owns projects and sessions. The center column becomes the active conversation.
-          The right inspector handles review, files, and SDLC state in one place.
+          Turn a brief or an existing codebase into discovery notes, architecture, journeys,
+          wireframes, implementation work, testing outputs, and handover artifacts inside one
+          local-first workflow.
         </p>
 
         <div className="entry-card-grid">
@@ -2459,7 +3529,7 @@ function App() {
       </section>
 
       <aside className="setup-sidebar">
-        <section className="card journey-card">
+        {/* <section className="card journey-card">
           <p className="section-label">User journey</p>
           <div className="journey-list">
             {journeyStages.map((stage) => (
@@ -2468,7 +3538,7 @@ function App() {
               </div>
             ))}
           </div>
-        </section>
+        </section> */}
 
         <section className="card runtime-card">
           <p className="section-label">Recent projects</p>
@@ -2642,28 +3712,49 @@ function App() {
   const renderWorkspaceHeader = () => (
     <header className="workspace-header">
       <div className="workspace-header-main">
-        <div>
-          <p className="section-label">Active workspace</p>
-          <h1>{activeSession?.title ?? activeProject?.name ?? "Workspace"}</h1>
-          <p className="workspace-header-copy">
-            {activeProject?.name} · {activeSession?.summary ?? "Select a session to start"}
-          </p>
+        <div className="workspace-header-copy-block">
+          <h1>{workspaceTitle}</h1>
+          <p className="workspace-header-copy">{workspaceSubtitle || "Open a session to start working."}</p>
+          {activeProject ? (
+            <div className="workspace-session-controls">
+              <label className="workspace-session-picker">
+                <span className="workspace-session-picker-label">Session</span>
+                <select
+                  className="workspace-session-picker-control"
+                  value={activeSession?.id ?? ""}
+                  onChange={(event) => {
+                    if (!event.target.value) {
+                      return
+                    }
+
+                    void handleSelectSession(activeProject.id, event.target.value)
+                  }}
+                  disabled={!activeProject || activeProjectSessions.length === 0}
+                >
+                  {activeProjectSessions.map((session) => (
+                    <option key={session.id} value={session.id}>
+                      {session.title}
+                    </option>
+                  ))}
+                </select>
+              </label>
+            </div>
+          ) : null}
         </div>
-        <button type="button" className="workspace-search-button secondary">
-          Search workspace
-        </button>
-      </div>
-      <div className="workspace-header-meta">
-        {activePhase ? <span className={`status status-${activePhase.status}`}>{phaseStatusLabels[activePhase.status]}</span> : null}
-        {activePhase ? <span className="pill">{activePhase.name}</span> : null}
-        {activeProject ? <span className="pill">{workflowModeLabels[activeProject.workflowMode]}</span> : null}
-        <button
-          type="button"
-          className="secondary action-button"
-          onClick={() => patchLayout({ inspectorOpen: !layout.inspectorOpen })}
-        >
-          {layout.inspectorOpen ? "Hide inspector" : "Show inspector"}
-        </button>
+        <div className="workspace-header-actions">
+          {headerPhase ? (
+            <span className={`status status-${headerPhase.status} workspace-header-status`}>
+              {activeChatAgentLabel} · {phaseStatusLabels[headerPhase.status]}
+            </span>
+          ) : null}
+          <button
+            type="button"
+            className="secondary action-button"
+            onClick={() => patchLayout({ inspectorOpen: !layout.inspectorOpen })}
+          >
+            {layout.inspectorOpen ? "Hide inspector" : "Show inspector"}
+          </button>
+        </div>
       </div>
     </header>
   )
@@ -2680,7 +3771,7 @@ function App() {
                 <span className="message-label">{message.label}</span>
                 <span className="thread-card-time">{formatDate(message.createdAt)}</span>
               </div>
-              <p>{message.body}</p>
+              {renderThreadMessageBody(message)}
               {message.chips.length > 0 ? (
                 <div className="message-chip-row">
                   {message.chips.map((chip) => (
@@ -2692,65 +3783,101 @@ function App() {
               ) : null}
             </article>
           ))}
+          {liveTurn &&
+          dashboard.activeProject &&
+          dashboard.activeSession &&
+          liveTurn.projectId === dashboard.activeProject.id &&
+          liveTurn.sessionId === dashboard.activeSession.id ? (
+            <>
+              <article className="thread-card thread-card-assistant thread-card-live">
+                <div className="thread-card-header">
+                  <span className="message-label">{activeChatAgentLabel}</span>
+                  <span className="thread-card-time">{liveTurn.started ? "Streaming" : "Waiting"}</span>
+                </div>
+                <div className="thread-card-body-rich">
+                  {liveTurn.assistantText ? renderMarkdownContent(liveTurn.assistantText) : "…"}
+                </div>
+              </article>
+            </>
+          ) : null}
         </div>
       )}
     </section>
   )
 
   const renderPromptComposer = () => (
-    <form className="prompt-dock" onSubmit={handleSendMessage}>
-      <div className="composer-chips">
-        {activeProject ? <span className="pill">{projectTypeLabels[activeProject.projectType]}</span> : null}
-        {activeProject ? <span className="pill">{workflowModeLabels[activeProject.workflowMode]}</span> : null}
-        {activePhase ? <span className="pill accent">{activePhase.name}</span> : null}
-        {activeSession ? <span className="pill">{activeSession.kind}</span> : null}
-      </div>
+    <form ref={promptFormRef} className="prompt-dock" onSubmit={handleSendMessage}>
       <div className="composer card">
+        <div className="composer-context">
+          <span className="composer-context-primary">{activeChatAgentLabel}</span>
+          {activeArtifactName ? (
+            <span className="composer-context-secondary">{activeArtifactName}</span>
+          ) : null}
+        </div>
+        <div className="composer-toolbar">
+          <label className="composer-picker">
+            <span className="composer-picker-label">Model</span>
+            <select
+              className="composer-picker-control"
+              value={activeSession?.selectedModel ?? ""}
+              onChange={(event) =>
+                void handleSessionPreferenceChange({
+                  selectedModel: event.target.value || null
+                })
+              }
+              disabled={!activeSession}
+            >
+              {modelOptions.map((option) => (
+                <option key={option.value || "default"} value={option.value}>
+                  {option.label}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label className="composer-picker">
+            <span className="composer-picker-label">Agent</span>
+            <select
+              className="composer-picker-control"
+              value={activeSession?.selectedAgentId ?? "auto"}
+              onChange={(event) =>
+                void handleSessionPreferenceChange({
+                  selectedAgentId: event.target.value as SessionAgentId
+                })
+              }
+              disabled={!activeSession}
+            >
+              {sessionAgentOptions.map((option) => (
+                <option key={option.value} value={option.value}>
+                  {option.value === "auto" && activePhase
+                    ? `${option.label} · ${activePhase.name}`
+                    : option.label}
+                </option>
+              ))}
+            </select>
+          </label>
+        </div>
         <textarea
+          ref={promptInputRef}
           className="composer-editor"
           value={promptDraft}
           onChange={(event) => setPromptDraft(event.target.value)}
-          placeholder="Guide the workflow, ask for a revision, or redirect the current session."
+          onKeyDown={handleComposerKeyDown}
+          placeholder="Message Codex…"
         />
-        <div className="composer-footer">
-          <div className="composer-footer-main">
-            <div className="composer-actions">
-              <button
-                type="button"
-                className={`secondary action-button ${layout.inspectorTab === "review" ? "action-button-active" : ""}`}
-                onClick={() => patchLayout({ inspectorOpen: true, inspectorTab: "review" })}
-              >
-                Review
+        <div className="composer-footer composer-footer-minimal">
+          <span className="composer-footer-hint">
+            {activeProject?.name ?? "Workspace"} · {activeSession?.selectedModel ?? "default model"} · Enter to send · Shift+Enter for newline
+          </span>
+          <div className="composer-button-row">
+            {isSendingMessage ? (
+              <button type="button" className="secondary action-button" onClick={handleInterruptSession}>
+                Interrupt
               </button>
-              <button
-                type="button"
-                className={`secondary action-button ${layout.inspectorTab === "files" ? "action-button-active" : ""}`}
-                onClick={() => patchLayout({ inspectorOpen: true, inspectorTab: "files" })}
-              >
-                Files
-              </button>
-              <button
-                type="button"
-                className={`secondary action-button ${layout.inspectorTab === "sdlc" ? "action-button-active" : ""}`}
-                onClick={() => patchLayout({ inspectorOpen: true, inspectorTab: "sdlc" })}
-              >
-                SDLC
-              </button>
-              {currentPhaseActions.map((action) => (
-                <button
-                  key={action.status}
-                  type="button"
-                  className={action.tone === "secondary" ? "secondary action-button" : "action-button"}
-                  onClick={() => void handlePhaseStatusUpdate(activePhase!.id, action.status)}
-                >
-                  {action.label}
-                </button>
-              ))}
-            </div>
+            ) : null}
+            <button type="submit" className="composer-send" disabled={isSendingMessage}>
+              {isSendingMessage ? "…" : "→"}
+            </button>
           </div>
-          <button type="submit" className="composer-send" disabled={isSendingMessage}>
-            {isSendingMessage ? "…" : "→"}
-          </button>
         </div>
       </div>
     </form>
@@ -2783,91 +3910,57 @@ function App() {
 
   const renderFilesPane = () => (
     <div className="inspector-panel-body">
-      <div className="inspector-panel-header inspector-panel-header-tight">
-        <div>
-          <p className="section-label">Files</p>
-          <h2>{layout.activeFileTab ?? "Workspace files"}</h2>
-        </div>
-      </div>
-
       {layout.openedFileTabs.length > 0 ? (
-        <div className="file-tab-row">
-          {layout.openedFileTabs.map((tab) => (
-            <div
-              key={tab}
-              className={`file-tab ${layout.activeFileTab === tab ? "file-tab-active" : ""}`}
-            >
-              <button
-                type="button"
-                className="file-tab-button"
-                onClick={() => patchLayout({ activeFileTab: tab, inspectorTab: "files", inspectorOpen: true })}
-              >
-                {tab.split("/").pop()}
-              </button>
-              <button
-                type="button"
-                className="file-tab-close"
-                onClick={() => closeFileTab(tab)}
-              >
-                ×
-              </button>
+        <>
+          <div className="inspector-panel-header inspector-panel-header-tight">
+            <div>
+              <p className="section-label">Files</p>
+              <h2>{layout.activeFileTab ?? "Workspace files"}</h2>
             </div>
-          ))}
-        </div>
-      ) : null}
+          </div>
 
-      {renderFileBody(activeFileContent, "Select a file", "Choose a file from the workspace tree to open it here.")}
+          <div className="file-tab-row">
+            {layout.openedFileTabs.map((tab) => (
+              <div
+                key={tab}
+                className={`file-tab ${layout.activeFileTab === tab ? "file-tab-active" : ""}`}
+              >
+                <button
+                  type="button"
+                  className="file-tab-button"
+                  onClick={() => patchLayout({ activeFileTab: tab, inspectorTab: "files", inspectorOpen: true })}
+                >
+                  {tab.split("/").pop()}
+                </button>
+                <button
+                  type="button"
+                  className="file-tab-close"
+                  onClick={() => closeFileTab(tab)}
+                >
+                  ×
+                </button>
+              </div>
+            ))}
+          </div>
+
+          {renderFileBody(activeFileContent, "", "")}
+        </>
+      ) : null}
     </div>
   )
 
   const renderSdlcPane = () => (
     <div className="inspector-panel-body">
-      <div className="inspector-panel-header inspector-panel-header-tight">
-        <div>
-          <p className="section-label">SDLC</p>
-          <h2>{selectedSdlcPhase?.name ?? "Workflow"}</h2>
-        </div>
-        {selectedSdlcPhase ? (
-          <span className={`status status-${selectedSdlcPhase.status}`}>
-            {phaseStatusLabels[selectedSdlcPhase.status]}
-          </span>
-        ) : null}
+      <div className="inspector-empty">
+        <strong>{selectedSdlcPhase ? selectedSdlcPhase.name : "Select a phase"}</strong>
+        <p>
+          {selectedSdlcPhase
+            ? selectedSdlcArtifactPath
+              ? "SDLC phases manage workflow state here. Open the actual artifact from All files when you want to inspect it."
+              : "This phase does not have a primary artifact on disk yet."
+            : "Choose a phase from the SDLC sidebar to inspect its status and handoff state."}
+        </p>
       </div>
-
-      {selectedSdlcPhase ? (
-        <div className="sdlc-summary card-quiet">
-          <p>{selectedSdlcPhase.summary}</p>
-          <div className="composer-actions">
-            {selectedSdlcArtifactPath ? (
-              <button
-                type="button"
-                className="secondary action-button"
-                onClick={() => void handleOpenSdlcArtifact(selectedSdlcArtifactPath, "review")}
-              >
-                Open in review
-              </button>
-            ) : null}
-            {phaseActions(selectedSdlcPhase).map((action) => (
-              <button
-                key={action.status}
-                type="button"
-                className={action.tone === "secondary" ? "secondary action-button" : "action-button"}
-                onClick={() => void handlePhaseStatusUpdate(selectedSdlcPhase.id, action.status)}
-              >
-                {action.label}
-              </button>
-            ))}
-          </div>
-        </div>
-      ) : null}
-
-      {renderFileBody(
-        sdlcArtifactContent,
-        selectedSdlcArtifactPath ? "Artifact not opened" : "No phase artifact yet",
-        selectedSdlcArtifactPath
-          ? "Select the phase row in the sidebar to inspect its primary artifact here."
-          : "This phase does not have a primary artifact on disk yet."
-      )}
     </div>
   )
 
@@ -2875,33 +3968,82 @@ function App() {
     if (layout.inspectorTab === "sdlc") {
       return (
         <div className="inspector-tree">
+          {selectedSdlcPhase ? (
+            <div className="phase-sidebar-focus card-quiet">
+              <div className="phase-focus-topline">
+                <div className="phase-tree-item-row">
+                  <span className={`phase-tree-dot phase-tree-dot-${selectedSdlcPhase.status}`} />
+                  <strong>{selectedSdlcPhase.name}</strong>
+                </div>
+                <span className={`phase-status-pill phase-status-pill-${selectedSdlcPhase.status}`}>
+                  <span className="phase-status-pill-glyph">
+                    {phaseStatusMeta[selectedSdlcPhase.status].glyph}
+                  </span>
+                  {phaseStatusLabels[selectedSdlcPhase.status]}
+                </span>
+              </div>
+              <p>{selectedSdlcPhase.summary}</p>
+              <div className="phase-focus-meta">
+                <div className="phase-focus-meta-row">
+                  <span className="phase-focus-meta-label">Artifact</span>
+                  <span className="phase-focus-meta-value">
+                    {getPhaseFocusArtifactLabel(workflow, selectedSdlcPhase.id)}
+                  </span>
+                </div>
+                {selectedSdlcHandoff ? (
+                  <div className="phase-focus-meta-row">
+                    <span className="phase-focus-meta-label">Next</span>
+                    <span className="phase-focus-meta-value">
+                      {phaseDefinitions.find((phase) => phase.id === selectedSdlcHandoff.toPhaseId)?.name ??
+                        selectedSdlcHandoff.toPhaseId}
+                    </span>
+                  </div>
+                ) : null}
+              </div>
+              {selectedSdlcHandoff ? (
+                <div className="phase-handoff-note">
+                  <strong>
+                    Suggested next agent:{" "}
+                    {phaseDefinitions.find((phase) => phase.id === selectedSdlcHandoff.toPhaseId)?.name ??
+                      selectedSdlcHandoff.toPhaseId}
+                  </strong>
+                  {selectedSdlcHandoff.reason ? <p>{selectedSdlcHandoff.reason}</p> : null}
+                  <span>Reply in chat to move forward.</span>
+                </div>
+              ) : selectedSdlcPhase.status === "review_ready" ? (
+                <div className="phase-handoff-note">
+                  <strong>Ready for review</strong>
+                  <span>The active agent is waiting in chat for your next instruction.</span>
+                </div>
+              ) : null}
+            </div>
+          ) : null}
+
           {workflow?.phases.map((phase) => (
             <button
               key={phase.id}
               type="button"
               className={`phase-tree-item ${layout.selectedSdlcPhase === phase.id ? "phase-tree-item-active" : ""}`}
-              onClick={() => {
-                const phaseArtifactPath = getPhasePrimaryArtifactPath(workflow, phase.id)
-
-                if (phaseArtifactPath) {
-                  void handleOpenSdlcArtifact(phaseArtifactPath, "sdlc")
-                  patchLayout({
-                    selectedSdlcPhase: phase.id
-                  })
-                  return
-                }
-
+              onClick={() =>
                 patchLayout({
                   selectedSdlcPhase: phase.id,
                   openedSdlcArtifactPath: null
                 })
-              }}
+              }
             >
-              <div className="phase-tree-item-row">
-                <span className={`phase-tree-dot phase-tree-dot-${phase.status}`} />
-                <strong>{phase.name}</strong>
+              <div className="phase-tree-main">
+                <div className="phase-tree-item-row">
+                  <span className={`phase-tree-dot phase-tree-dot-${phase.status}`} />
+                  <strong>{phase.name}</strong>
+                </div>
+                <span className="phase-tree-caption">{getPhaseRowDetail(phase, workflow)}</span>
               </div>
-              <span>{phase.status === "approved" ? "Artifact ready" : phaseStatusLabels[phase.status]}</span>
+              <span className={`phase-tree-indicator phase-tree-indicator-${phase.status}`}>
+                <span className="phase-tree-indicator-glyph">
+                  {phaseStatusMeta[phase.status].glyph}
+                </span>
+                {phaseStatusMeta[phase.status].shortLabel}
+              </span>
             </button>
           ))}
         </div>
@@ -2926,12 +4068,30 @@ function App() {
   }
 
   const renderInspector = () => (
-    <aside className="inspector-shell card" style={{ width: `${layout.inspectorWidth}px` }}>
-      <div className="inspector-main">
-        {layout.inspectorTab === "review" ? renderReviewPane() : null}
-        {layout.inspectorTab === "files" ? renderFilesPane() : null}
-        {layout.inspectorTab === "sdlc" ? renderSdlcPane() : null}
-      </div>
+    <aside
+      className={`inspector-shell card ${shouldShowInspectorMain ? "" : "inspector-shell-collapsed"}`}
+      style={{ width: `${shouldShowInspectorMain ? layout.inspectorWidth : layout.reviewSidebarWidth}px` }}
+    >
+      {shouldShowInspectorMain ? (
+        <>
+          <div className="inspector-main">
+            {layout.inspectorTab === "review" ? renderReviewPane() : null}
+            {layout.inspectorTab === "files" ? renderFilesPane() : null}
+            {layout.inspectorTab === "sdlc" ? renderSdlcPane() : null}
+          </div>
+          <div
+            className="pane-resizer pane-resizer-inspector"
+            role="separator"
+            aria-orientation="vertical"
+            aria-label="Resize inspector sidebar"
+            aria-valuemin={inspectorMinSidebarWidth}
+            aria-valuemax={inspectorMaxSidebarWidth}
+            aria-valuenow={Math.round(layout.reviewSidebarWidth)}
+            onMouseDown={startInspectorResize}
+            onDoubleClick={resetInspectorWidths}
+          />
+        </>
+      ) : null}
 
       <div
         className="inspector-sidebar"
@@ -2969,12 +4129,25 @@ function App() {
   )
 
   const renderWorkspace = () => (
-    <main className="workspace-layout">
-      <section className="workspace-center card">
+    <main ref={workspaceLayoutRef} className="workspace-layout">
+      <section className="workspace-center card" style={{ width: `${layout.centerWidth}px` }}>
         {renderWorkspaceHeader()}
         {renderSessionTimeline()}
         {renderPromptComposer()}
       </section>
+      {layout.inspectorOpen ? (
+        <div
+          className="pane-resizer pane-resizer-workspace"
+          role="separator"
+          aria-orientation="vertical"
+          aria-label="Resize workspace panes"
+          aria-valuemin={workspaceMinCenterWidth}
+          aria-valuemax={workspaceMaxCenterWidth}
+          aria-valuenow={Math.round(layout.centerWidth)}
+          onMouseDown={startWorkspaceResize}
+          onDoubleClick={resetWorkspaceWidths}
+        />
+      ) : null}
       {layout.inspectorOpen ? renderInspector() : null}
     </main>
   )
@@ -3005,7 +4178,7 @@ function App() {
 
       {error ? <div className="global-banner global-banner-error">{error}</div> : null}
 
-      <div className={`shell-layout ${layout.sidebarOpen ? "" : "shell-layout-collapsed"}`}>
+      <div className="shell-layout shell-layout-collapsed">
         {renderSidebar()}
         <div className="shell-content">{renderMainContent()}</div>
       </div>

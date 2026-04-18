@@ -2,9 +2,14 @@ import { app, BrowserWindow, ipcMain } from "electron"
 import path from "node:path"
 import { fileURLToPath } from "node:url"
 import { desktopBridgeHandlers } from "./bridge.js"
+import { subscribeCodexEvents } from "./codex-app-server.js"
+import { loadLocalEnv } from "./load-local-env.js"
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
+const appRoot = path.resolve(__dirname, "..")
+
+loadLocalEnv(appRoot)
 
 const createWindow = async () => {
   const window = new BrowserWindow({
@@ -51,6 +56,12 @@ const createWindow = async () => {
 }
 
 app.whenReady().then(async () => {
+  subscribeCodexEvents((event) => {
+    for (const window of BrowserWindow.getAllWindows()) {
+      window.webContents.send("codex:event", event)
+    }
+  })
+
   ipcMain.handle("app:get-shell-info", () => {
     return {
       appName: app.getName(),
@@ -72,6 +83,8 @@ app.whenReady().then(async () => {
   ipcMain.handle("session:delete", desktopBridgeHandlers.deleteSession)
   ipcMain.handle("session:get-messages", desktopBridgeHandlers.getSessionMessages)
   ipcMain.handle("session:send-message", desktopBridgeHandlers.sendSessionMessage)
+  ipcMain.handle("session:update-preferences", desktopBridgeHandlers.updateSessionPreferences)
+  ipcMain.handle("session:interrupt", desktopBridgeHandlers.interruptSession)
   ipcMain.handle("workspace:list-entries", desktopBridgeHandlers.listWorkspaceEntries)
   ipcMain.handle("workspace:read-file", desktopBridgeHandlers.readWorkspaceFile)
   ipcMain.handle("directory:pick", desktopBridgeHandlers.pickDirectory)

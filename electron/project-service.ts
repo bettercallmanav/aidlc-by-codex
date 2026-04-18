@@ -2,12 +2,40 @@ import { app } from "electron"
 import { randomUUID } from "node:crypto"
 import fs from "node:fs/promises"
 import path from "node:path"
+import { sendCodexSessionMessage } from "./codex-app-server.js"
+import {
+  getPhaseDefinition,
+  getNextPhaseId,
+  getSupplementalAgentDefinition,
+  phaseDefinitions,
+  phasePrimaryArtifacts,
+  projectTypeLabels,
+  supplementalAgentDefinitions,
+  workflowFolderNames,
+  workflowModeLabels,
+  type PhaseDefinition,
+  type PhaseId,
+  type ProjectType,
+  type SupplementalAgentId,
+  type WorkflowMode
+} from "./sdlc-phases.js"
 
-type ProjectType = "new_project" | "existing_codebase"
-type WorkflowMode = "full_sdlc" | "scaffold_first" | "analyze_existing"
-type SessionKind = "setup" | "analysis" | "discovery" | "architecture" | "implementation" | "general"
+type SessionKind =
+  | "setup"
+  | "analysis"
+  | "discovery"
+  | "architecture"
+  | "journey"
+  | "wireframe"
+  | "implementation"
+  | "testing"
+  | "devops"
+  | "handover"
+  | "general"
 type SessionStatus = "active" | "idle" | "archived"
+type SessionTitleSource = "seeded" | "pending_first_message" | "message" | "manual"
 type SessionMessageRole = "system" | "user" | "assistant"
+type SessionAgentId = "auto" | "workspace" | PhaseId | SupplementalAgentId
 type PhaseStatus =
   | "not_started"
   | "running"
@@ -22,15 +50,10 @@ type WorkspaceFileKind =
   | "json"
   | "code"
   | "text"
+  | "image"
   | "directory"
   | "unsupported"
   | "not_found"
-
-type PhaseDefinition = {
-  id: string
-  name: string
-  summary: string
-}
 
 type WorkflowPhase = PhaseDefinition & {
   status: PhaseStatus
@@ -61,10 +84,15 @@ type SessionRecord = {
   id: string
   projectId: string
   title: string
+  titleSource: SessionTitleSource
   kind: SessionKind
   status: SessionStatus
   summary: string
   preview: string
+  selectedModel: string | null
+  selectedAgentId: SessionAgentId
+  codexConversationId?: string | null
+  codexRolloutPath?: string | null
   createdAt: string
   updatedAt: string
 }
@@ -79,11 +107,27 @@ type SessionMessageRecord = {
   createdAt: string
 }
 
+type ToolUiAction =
+  | {
+      type: "open_file"
+      relativePath: string
+      targetTab: "files" | "review"
+    }
+  | null
+
+type PendingHandoff = {
+  fromPhaseId: PhaseId
+  toPhaseId: PhaseId
+  reason?: string
+  createdAt: string
+}
+
 type WorkflowState = {
   projectId: string
   activePhaseId: string | null
   phases: WorkflowPhase[]
   artifacts: ArtifactRecord[]
+  pendingHandoff?: PendingHandoff | null
 }
 
 type WorkspaceEntry = {
@@ -100,6 +144,7 @@ type WorkspaceFileContent = {
   kind: WorkspaceFileKind
   language?: string
   content?: string
+  dataUrl?: string
 }
 
 type StoreState = {
@@ -129,71 +174,7 @@ type DashboardData = {
 type SendSessionMessageResult = {
   dashboard: DashboardData
   messages: SessionMessageRecord[]
-}
-
-const phaseDefinitions: PhaseDefinition[] = [
-  {
-    id: "discovery",
-    name: "Discovery",
-    summary: "Collect the brief, clarify scope, and generate structured requirements."
-  },
-  {
-    id: "architecture",
-    name: "Architecture",
-    summary: "Translate approved requirements into modules, APIs, and infrastructure."
-  },
-  {
-    id: "journey",
-    name: "Journey",
-    summary: "Map user and admin flows, screens, and navigation edge cases."
-  },
-  {
-    id: "wireframe",
-    name: "Wireframe",
-    summary: "Define screens, component inventory, and low-fi UI planning."
-  },
-  {
-    id: "coder",
-    name: "Coder",
-    summary: "Prepare implementation structure, starter code, and code map outputs."
-  },
-  {
-    id: "testing",
-    name: "Testing",
-    summary: "Review quality, generate test plans, and capture result summaries."
-  },
-  {
-    id: "devops",
-    name: "DevOps",
-    summary: "Prepare deployment guidance, environment setup, and operational checks."
-  },
-  {
-    id: "handover",
-    name: "Handover",
-    summary: "Package final project outputs into delivery-ready documentation."
-  }
-]
-
-const workflowFolderNames: Record<string, string> = {
-  discovery: "discovery",
-  architecture: "architecture",
-  journey: "journeys",
-  wireframe: "wireframes",
-  coder: "coder",
-  testing: "testing",
-  devops: "devops",
-  handover: "handover"
-}
-
-const phasePrimaryArtifacts: Record<string, string> = {
-  discovery: "requirements.md",
-  architecture: "architecture.md",
-  journey: "user-journeys.md",
-  wireframe: "wireframes.md",
-  coder: "implementation-summary.md",
-  testing: "test-plan.md",
-  devops: "deployment-guide.md",
-  handover: "client-handover.md"
+  uiAction?: ToolUiAction
 }
 
 const ignoredWorkspaceEntries = new Set([
@@ -222,17 +203,6 @@ const textExtensionMap: Record<
   ".ts": { kind: "code", language: "typescript" },
   ".tsx": { kind: "code", language: "tsx" },
   ".txt": { kind: "text", language: "text" }
-}
-
-const workflowModeLabels: Record<WorkflowMode, string> = {
-  full_sdlc: "Full SDLC workflow",
-  scaffold_first: "Scaffold-first flow",
-  analyze_existing: "Analyze existing codebase"
-}
-
-const projectTypeLabels: Record<ProjectType, string> = {
-  new_project: "New project",
-  existing_codebase: "Imported existing folder"
 }
 
 const slugify = (value: string) =>
@@ -273,6 +243,38 @@ const getWorkflowStatePath = (workflowPath: string) => path.join(workflowPath, "
 const normalizeRelativePath = (value: string | undefined) =>
   (value ?? "").replace(/\\/g, "/").replace(/^\/+/, "").replace(/\/+$/, "")
 
+const pendingSessionTitle = "New session"
+
+const isSessionTitleSource = (value: unknown): value is SessionTitleSource =>
+  value === "seeded" ||
+  value === "pending_first_message" ||
+  value === "message" ||
+  value === "manual"
+
+const normalizeSessionTitleSource = (
+  titleSource: unknown,
+  title: string | null | undefined
+): SessionTitleSource => {
+  if (isSessionTitleSource(titleSource)) {
+    return titleSource
+  }
+
+  return title?.trim() === pendingSessionTitle ? "pending_first_message" : "manual"
+}
+
+const deriveSessionTitleFromMessage = (message: string) => {
+  const normalized = message.replace(/\s+/g, " ").trim()
+
+  if (!normalized) {
+    return pendingSessionTitle
+  }
+
+  const maxLength = 56
+  return normalized.length <= maxLength
+    ? normalized
+    : `${normalized.slice(0, maxLength - 3).trimEnd()}...`
+}
+
 const toWorkspaceRelativePath = (workspacePath: string, absolutePath: string) =>
   path.relative(workspacePath, absolutePath).split(path.sep).join("/")
 
@@ -295,11 +297,15 @@ const resolveWorkspaceTarget = (workspacePath: string, relativePath?: string) =>
   }
 }
 
-const getPhaseFolderRelativePath = (phaseId: string) =>
-  `.project-workflow/${workflowFolderNames[phaseId] ?? phaseId}`
+const getPhaseFolderRelativePath = (phaseId: string) => {
+  const typedPhaseId = phaseId as PhaseId
+  return `.project-workflow/${workflowFolderNames[typedPhaseId] ?? phaseId}`
+}
 
-const getPhaseArtifactRelativePath = (phaseId: string) =>
-  `${getPhaseFolderRelativePath(phaseId)}/${phasePrimaryArtifacts[phaseId] ?? "artifact.md"}`
+const getPhaseArtifactRelativePath = (phaseId: string) => {
+  const typedPhaseId = phaseId as PhaseId
+  return `${getPhaseFolderRelativePath(phaseId)}/${phasePrimaryArtifacts[typedPhaseId] ?? "artifact.md"}`
+}
 
 const buildInitialWorkflowState = (projectId: string): WorkflowState => {
   const now = new Date().toISOString()
@@ -312,7 +318,8 @@ const buildInitialWorkflowState = (projectId: string): WorkflowState => {
       status: index === 0 ? "running" : "not_started",
       lastUpdatedAt: now
     })),
-    artifacts: []
+    artifacts: [],
+    pendingHandoff: null
   }
 }
 
@@ -365,6 +372,12 @@ const normalizeProject = (project: Partial<ProjectRecord>): ProjectRecord | null
   }
 }
 
+const isSessionAgentId = (value: string | null | undefined): value is SessionAgentId =>
+  value === "auto" ||
+  value === "workspace" ||
+  Boolean(getPhaseDefinition(value)) ||
+  Boolean(getSupplementalAgentDefinition(value))
+
 const normalizeSession = (session: Partial<SessionRecord>): SessionRecord | null => {
   if (!session.id || !session.projectId || !session.title) {
     return null
@@ -372,9 +385,19 @@ const normalizeSession = (session: Partial<SessionRecord>): SessionRecord | null
 
   const kind: SessionKind =
     session.kind &&
-    ["setup", "analysis", "discovery", "architecture", "implementation", "general"].includes(
-      session.kind
-    )
+    [
+      "setup",
+      "analysis",
+      "discovery",
+      "architecture",
+      "journey",
+      "wireframe",
+      "implementation",
+      "testing",
+      "devops",
+      "handover",
+      "general"
+    ].includes(session.kind)
       ? session.kind
       : "general"
 
@@ -387,10 +410,17 @@ const normalizeSession = (session: Partial<SessionRecord>): SessionRecord | null
     id: session.id,
     projectId: session.projectId,
     title: session.title,
+    titleSource: normalizeSessionTitleSource(session.titleSource, session.title),
     kind,
     status,
     summary: session.summary ?? "Task-focused thread inside the project workspace.",
     preview: session.preview ?? "Use this session to guide a specific workflow task.",
+    selectedModel:
+      typeof session.selectedModel === "string" ? session.selectedModel.trim() || null : null,
+    selectedAgentId: isSessionAgentId(session.selectedAgentId) ? session.selectedAgentId : "auto",
+    codexConversationId:
+      typeof session.codexConversationId === "string" ? session.codexConversationId : null,
+    codexRolloutPath: typeof session.codexRolloutPath === "string" ? session.codexRolloutPath : null,
     createdAt: session.createdAt ?? new Date().toISOString(),
     updatedAt: session.updatedAt ?? session.createdAt ?? new Date().toISOString()
   }
@@ -503,6 +533,26 @@ const inferWorkspaceEntryKind = (relativePath: string): WorkspaceEntryKind => {
 const getTextFileDescriptor = (relativePath: string) =>
   textExtensionMap[path.extname(relativePath).toLowerCase()] ?? null
 
+const imageExtensions = new Set([".png", ".jpg", ".jpeg", ".webp", ".gif"])
+
+const getImageFileDescriptor = (relativePath: string) =>
+  imageExtensions.has(path.extname(relativePath).toLowerCase()) ? { kind: "image" as const } : null
+
+const resolveImageApiKey = () =>
+  process.env.OPENAI_API_KEY?.trim() || process.env.CODEX_API_KEY?.trim() || null
+
+const normalizeGeneratedImageFilename = (value: string | undefined) => {
+  const fallback = `wireframe-${Date.now()}.png`
+  if (!value) {
+    return fallback
+  }
+
+  const ext = path.extname(value).toLowerCase()
+  const base = slugify(path.basename(value, ext)) || "wireframe"
+  const safeExt = ext === ".jpg" || ext === ".jpeg" || ext === ".webp" || ext === ".png" ? ext : ".png"
+  return `${base}${safeExt}`
+}
+
 const getActiveOrFocusedPhase = (workflow: WorkflowState) =>
   workflow.phases.find((phase) => phase.id === workflow.activePhaseId) ??
   workflow.phases.find((phase) =>
@@ -510,6 +560,235 @@ const getActiveOrFocusedPhase = (workflow: WorkflowState) =>
   ) ??
   workflow.phases[0] ??
   null
+
+const findPhase = (workflow: WorkflowState, phaseToken?: string | null) => {
+  if (!phaseToken) {
+    return getActiveOrFocusedPhase(workflow)
+  }
+
+  const normalized = phaseToken.trim().toLowerCase()
+
+  return (
+    workflow.phases.find((phase) => phase.id === normalized) ??
+    workflow.phases.find((phase) => phase.name.toLowerCase() === normalized) ??
+    workflow.phases.find((phase) => phase.name.toLowerCase().startsWith(normalized)) ??
+    null
+  )
+}
+
+const getPrimaryArtifactForPhase = (workflow: WorkflowState, phaseId: string) => {
+  const typedPhaseId = phaseId as PhaseId
+  const preferredSuffix = `/${phasePrimaryArtifacts[typedPhaseId] ?? "artifact.md"}`
+
+  return (
+    workflow.artifacts.find(
+      (artifact) => artifact.phaseId === phaseId && artifact.path.endsWith(preferredSuffix)
+    )?.path ??
+    workflow.artifacts.find((artifact) => artifact.phaseId === phaseId)?.path ??
+    getPhaseArtifactRelativePath(phaseId)
+  )
+}
+
+const parseToolCommand = (input: string): { name: string; args: string[] } | null => {
+  if (!input.startsWith("/")) {
+    return null
+  }
+
+  const tokens = input
+    .slice(1)
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean)
+
+  if (tokens.length === 0) {
+    return null
+  }
+
+  return {
+    name: tokens[0].toLowerCase(),
+    args: tokens.slice(1)
+  }
+}
+
+type ParsedHandoffDirective = {
+  nextAgent: PhaseId
+  reason?: string
+}
+
+type ParsedImageDirective = {
+  prompt: string
+  filename?: string
+  size?: "1024x1024" | "1536x1024" | "1024x1536" | "auto"
+  quality?: "low" | "medium" | "high" | "auto"
+}
+
+const handoffDirectivePattern = /\[\[SDLC_HANDOFF\s+(\{[\s\S]*?\})\]\]/m
+const imageDirectivePattern = /\[\[GENERATE_WIREFRAME_IMAGE\s+(\{[\s\S]*?\})\]\]/g
+
+const parseHandoffDirective = (input: string): {
+  cleanedText: string
+  directive: ParsedHandoffDirective | null
+} => {
+  const match = input.match(handoffDirectivePattern)
+
+  if (!match) {
+    return {
+      cleanedText: input,
+      directive: null
+    }
+  }
+
+  try {
+    const parsed = JSON.parse(match[1]) as { nextAgent?: string; reason?: string }
+    if (!parsed.nextAgent || !getPhaseDefinition(parsed.nextAgent)) {
+      return {
+        cleanedText: input.replace(match[0], "").trim(),
+        directive: null
+      }
+    }
+
+    return {
+      cleanedText: input.replace(match[0], "").trim(),
+      directive: {
+        nextAgent: parsed.nextAgent as PhaseId,
+        reason: typeof parsed.reason === "string" ? parsed.reason.trim() : undefined
+      }
+    }
+  } catch {
+    return {
+      cleanedText: input.replace(match[0], "").trim(),
+      directive: null
+    }
+  }
+}
+
+const affirmativeHandoffPattern =
+  /^(?:yes|yep|yeah|sure|ok|okay|continue|proceed|go ahead|move ahead|move to next|next|start it|do it|switch)\b/i
+const negativeHandoffPattern =
+  /^(?:no|not yet|hold|wait|stop|don'?t|do not|needs changes|request changes|revise|change this|fix)\b/i
+
+const isAffirmativeHandoffReply = (input: string) => affirmativeHandoffPattern.test(input.trim())
+
+const isNegativeHandoffReply = (input: string) => negativeHandoffPattern.test(input.trim())
+
+const markPhaseReadyForHandoff = (
+  workflow: WorkflowState,
+  fromPhaseId: PhaseId,
+  toPhaseId: PhaseId,
+  reason?: string
+): WorkflowState => {
+  const expectedNextPhaseId = getNextPhaseId(fromPhaseId)
+
+  if (!expectedNextPhaseId || expectedNextPhaseId !== toPhaseId) {
+    return workflow
+  }
+
+  const now = new Date().toISOString()
+
+  return {
+    ...workflow,
+    activePhaseId: fromPhaseId,
+    phases: workflow.phases.map((phase) =>
+      phase.id === fromPhaseId
+        ? {
+            ...phase,
+            status: "review_ready" as const,
+            lastUpdatedAt: now
+          }
+        : phase
+    ),
+    pendingHandoff: {
+      fromPhaseId,
+      toPhaseId,
+      reason,
+      createdAt: now
+    }
+  }
+}
+
+const clearPendingHandoff = (workflow: WorkflowState): WorkflowState => ({
+  ...workflow,
+  pendingHandoff: null
+})
+
+const parseImageDirectives = (input: string): {
+  cleanedText: string
+  directives: ParsedImageDirective[]
+} => {
+  const matches = [...input.matchAll(imageDirectivePattern)]
+
+  if (matches.length === 0) {
+    return {
+      cleanedText: input,
+      directives: []
+    }
+  }
+
+  const directives = matches.flatMap((match) => {
+    try {
+      const parsed = JSON.parse(match[1]) as {
+        prompt?: string
+        filename?: string
+        size?: string
+        quality?: string
+      }
+
+      if (!parsed.prompt?.trim()) {
+        return []
+      }
+
+      return [
+        {
+          prompt: parsed.prompt.trim(),
+          filename: typeof parsed.filename === "string" ? parsed.filename.trim() : undefined,
+          size:
+            parsed.size === "1024x1024" ||
+            parsed.size === "1536x1024" ||
+            parsed.size === "1024x1536" ||
+            parsed.size === "auto"
+              ? parsed.size
+              : undefined,
+          quality:
+            parsed.quality === "low" ||
+            parsed.quality === "medium" ||
+            parsed.quality === "high" ||
+            parsed.quality === "auto"
+              ? parsed.quality
+              : undefined
+        } satisfies ParsedImageDirective
+      ]
+    } catch {
+      return []
+    }
+  })
+
+  return {
+    cleanedText: input.replaceAll(imageDirectivePattern, "").trim(),
+    directives
+  }
+}
+
+const formatGeneratedImageSummary = (paths: string[]) => {
+  if (paths.length === 1) {
+    return `Generated wireframe image: ${paths[0]}.`
+  }
+
+  return [
+    `Generated ${paths.length} wireframe images:`,
+    ...paths.map((relativePath) => `- ${relativePath}`)
+  ].join("\n")
+}
+
+const formatImageGenerationFailureSummary = (errors: string[]) => {
+  if (errors.length === 1) {
+    return `Wireframe image generation was requested but failed: ${errors[0]}.`
+  }
+
+  return [
+    `Some wireframe images failed to generate (${errors.length}):`,
+    ...errors.map((message) => `- ${message}`)
+  ].join("\n")
+}
 
 const getProjectFromState = (state: StoreState, projectId: string) => {
   const project = state.projects.find((item) => item.id === projectId)
@@ -556,10 +835,71 @@ const getDefaultSessionSeed = (project: ProjectRecord) => {
   }
 
   return {
-    title: "Project setup",
-    kind: "setup" as const,
-    summary: "Define the local workspace and start the shared SDLC flow.",
-    preview: "Clarify goals, roles, and the first artifact before Architecture begins."
+    title: "Discovery",
+    kind: "discovery" as const,
+    summary: "Gather requirements, clarify scope, and prepare the first reviewable artifact.",
+    preview: "Start Discovery by clarifying the problem, users, and must-have features."
+  }
+}
+
+const getSessionKindForPhase = (phaseId: string | null | undefined): SessionKind => {
+  switch (phaseId) {
+    case "discovery":
+      return "discovery"
+    case "architecture":
+      return "architecture"
+    case "journey":
+      return "journey"
+    case "wireframe":
+      return "wireframe"
+    case "coder":
+      return "implementation"
+    case "testing":
+      return "testing"
+    case "devops":
+      return "devops"
+    case "handover":
+      return "handover"
+    default:
+      return "general"
+  }
+}
+
+const getSessionSeedForPhase = (
+  project: ProjectRecord,
+  phaseId: string | null | undefined
+): {
+  title: string
+  kind: SessionKind
+  summary: string
+  preview: string
+} | null => {
+  const phase = getPhaseDefinition(phaseId)
+
+  if (!phase) {
+    return null
+  }
+
+  return {
+    title: phase.name,
+    kind: getSessionKindForPhase(phase.id),
+    summary: phase.summary,
+    preview:
+      phase.id === "discovery"
+        ? "Clarify requirements, trim scope, and produce a reviewable requirements document."
+        : phase.id === "architecture"
+          ? "Turn approved requirements into a concrete technical design and artifact set."
+          : phase.id === "journey"
+            ? "Map flows, users, and screens before visual design begins."
+            : phase.id === "wireframe"
+              ? "Define layouts, components, and UI planning artifacts."
+              : phase.id === "coder"
+                ? "Implement the documented plan and keep the artifact trail up to date."
+                : phase.id === "testing"
+                  ? "Create and run tests, then document coverage and failures."
+                  : phase.id === "devops"
+                    ? "Prepare deployment and operational readiness artifacts."
+                    : "Package final documentation and handover materials."
   }
 }
 
@@ -571,23 +911,72 @@ const createSessionRecord = (
     summary?: string
     preview?: string
     status?: SessionStatus
+    titleSource?: SessionTitleSource
   }
 ): SessionRecord => {
   const now = new Date().toISOString()
+  const titleSource = options?.titleSource ?? "manual"
 
   return {
     id: randomUUID(),
     projectId: project.id,
     title,
+    titleSource,
     kind: options?.kind ?? "general",
     status: options?.status ?? "active",
-    summary: options?.summary ?? `Task-focused session for ${title.toLowerCase()}.`,
+    summary:
+      options?.summary ??
+      (titleSource === "pending_first_message"
+        ? "Start a focused thread. The first message will set the session title."
+        : `Task-focused session for ${title.toLowerCase()}.`),
     preview:
       options?.preview ??
-      "Use this thread to revise artifacts, clarify scope, or explore implementation options.",
+      (titleSource === "pending_first_message"
+        ? "Send the first message to title this session automatically, then rename it anytime."
+        : "Use this thread to revise artifacts, clarify scope, or explore implementation options."),
+    selectedModel: null,
+    selectedAgentId: "auto",
+    codexConversationId: null,
+    codexRolloutPath: null,
     createdAt: now,
     updatedAt: now
   }
+}
+
+const getEffectiveAgentPhaseId = (
+  session: SessionRecord,
+  workflow: WorkflowState
+): PhaseId | null => {
+  if (session.selectedAgentId === "workspace") {
+    return null
+  }
+
+  if (session.selectedAgentId !== "auto") {
+    const phaseDefinition = getPhaseDefinition(session.selectedAgentId)
+
+    if (phaseDefinition) {
+      return phaseDefinition.id
+    }
+  }
+
+  const activePhase = getActiveOrFocusedPhase(workflow)
+  return activePhase ? (activePhase.id as PhaseId) : null
+}
+
+const getSelectedAgentLabel = (session: SessionRecord, workflow: WorkflowState) => {
+  if (session.selectedAgentId === "workspace") {
+    return "Workspace"
+  }
+
+  if (session.selectedAgentId !== "auto") {
+    return (
+      getPhaseDefinition(session.selectedAgentId)?.name ??
+      getSupplementalAgentDefinition(session.selectedAgentId)?.name ??
+      "Assistant"
+    )
+  }
+
+  return getPhaseDefinition(getEffectiveAgentPhaseId(session, workflow))?.name ?? "Assistant"
 }
 
 const buildPhaseSeedArtifact = (project: ProjectRecord, phase: WorkflowPhase) => `# ${phase.name} - ${project.name}
@@ -771,7 +1160,8 @@ const ensureProjectSessions = (state: StoreState, project: ProjectRecord) => {
       kind: seed.kind,
       status: "active",
       summary: seed.summary,
-      preview: seed.preview
+      preview: seed.preview,
+      titleSource: "seeded"
     })
 
     nextState = {
@@ -835,46 +1225,543 @@ const buildSeedMessages = (
 ): SessionMessageRecord[] => {
   const now = new Date().toISOString()
   const activePhase = getActiveOrFocusedPhase(workflow)
+  const effectiveAgentPhaseId = getEffectiveAgentPhaseId(session, workflow)
+  const effectiveAgent = getPhaseDefinition(effectiveAgentPhaseId)
+  const assistantLabel = getSelectedAgentLabel(session, workflow)
+  const phaseArtifact = effectiveAgent ? phasePrimaryArtifacts[effectiveAgent.id] : null
   const kickoffBody =
-    project.workflowMode === "analyze_existing"
-      ? "Import this repo, inspect the existing structure, and tell me the shortest path to a delivery-ready handover."
-      : project.workflowMode === "scaffold_first"
-        ? "Start with a scaffold, keep the workflow trail intact, and move toward useful implementation structure quickly."
-        : "Set up a project workspace where artifacts, approvals, and handoffs stay visible from Discovery through Handover."
-
-  const assistantBody = activePhase
-    ? `This session is anchored to ${activePhase.name}. I’ll keep the chat, the workspace files, and the review state aligned around ${phasePrimaryArtifacts[activePhase.id]}.`
-    : "This session is anchored to the shared workspace. I’ll keep the chat and the artifact trail aligned."
+    activePhase?.id === "discovery"
+      ? project.projectType === "existing_codebase"
+        ? "Inspect the existing workspace first, then turn that into a clear Discovery artifact."
+        : "Start Discovery. Clarify the problem, the users, and the must-have scope before anything else."
+      : activePhase?.id === "architecture"
+        ? "Discovery is approved. Convert requirements into a concrete architecture and stack recommendation."
+        : activePhase?.id === "journey"
+          ? "Architecture is approved. Map user journeys, flows, and the full screen list."
+          : activePhase?.id === "wireframe"
+            ? "Journey is approved. Plan the UI layouts, structure, and component inventory."
+            : activePhase?.id === "coder"
+              ? "Wireframes are approved. Implement the documented product incrementally."
+              : activePhase?.id === "testing"
+                ? "Implementation is ready for validation. Create and run the right tests."
+                : activePhase?.id === "devops"
+                  ? "Testing is complete. Prepare deployment and operational readiness."
+                  : activePhase?.id === "handover"
+                    ? "The project is near delivery. Package handover documentation."
+                    : project.workflowMode === "analyze_existing"
+                      ? "Import this repo, inspect the existing structure, and tell me the shortest path to a delivery-ready handover."
+                      : project.workflowMode === "scaffold_first"
+                        ? "Start with a scaffold, keep the workflow trail intact, and move toward useful implementation structure quickly."
+                        : "Set up a project workspace where artifacts, approvals, and handoffs stay visible from Discovery through Handover."
 
   return [
     {
       id: randomUUID(),
       sessionId: session.id,
       role: "system",
-      label: "Workspace context",
-      body: `${project.name} is running in ${workflowModeLabels[project.workflowMode]} against ${projectTypeLabels[project.projectType].toLowerCase()}. Files live under ${project.workspacePath}.`,
-      chips: [workflowModeLabels[project.workflowMode], projectTypeLabels[project.projectType]],
+      label: "Workspace",
+      body: `Attached to ${project.workspacePath}.`,
+      chips: [],
       createdAt: now
     },
     {
       id: randomUUID(),
       sessionId: session.id,
       role: "user",
-      label: session.title,
+      label: "You",
       body: kickoffBody,
-      chips: activePhase ? [activePhase.name] : [],
+      chips: [],
       createdAt: now
     },
     {
       id: randomUUID(),
       sessionId: session.id,
       role: "assistant",
-      label: "Workspace",
-      body: assistantBody,
-      chips: activePhase ? [phasePrimaryArtifacts[activePhase.id]] : [],
+      label: assistantLabel,
+      body: phaseArtifact
+        ? `This session is anchored to ${effectiveAgent?.name ?? activePhase?.name}. Keep ${phaseArtifact} reviewable and tell the user when it is ready for approval from the SDLC panel.`
+        : "I’ll keep this session aligned with the shared workspace and current workflow phase.",
+      chips: [],
       createdAt: now
     }
   ]
+}
+
+const persistSessionTurn = async (input: {
+  state: StoreState
+  project: ProjectRecord
+  session: SessionRecord
+  workflow: WorkflowState
+  userBody: string
+  assistantBody: string
+  assistantLabel?: string
+}): Promise<SendSessionMessageResult> => {
+  const now = new Date().toISOString()
+  const activePhase = getActiveOrFocusedPhase(input.workflow)
+  const userMessage: SessionMessageRecord = {
+    id: randomUUID(),
+    sessionId: input.session.id,
+    role: "user",
+    label: "You",
+    body: input.userBody,
+    chips: [],
+    createdAt: now
+  }
+
+  const assistantMessage: SessionMessageRecord = {
+    id: randomUUID(),
+    sessionId: input.session.id,
+    role: "assistant",
+    label: input.assistantLabel ?? activePhase?.name ?? "Assistant",
+    body: input.assistantBody,
+    chips: [],
+    createdAt: new Date(Date.now() + 1).toISOString()
+  }
+
+  const nextState = updateProjectTimestamp(
+    {
+      ...input.state,
+      sessions: input.state.sessions.map((item) => {
+        if (item.projectId !== input.project.id) {
+          return item
+        }
+
+        if (item.id === input.session.id) {
+          return {
+            ...item,
+            title:
+              item.titleSource === "pending_first_message"
+                ? deriveSessionTitleFromMessage(input.userBody)
+                : item.title,
+            titleSource:
+              item.titleSource === "pending_first_message" ? "message" : item.titleSource,
+            status: "active" as const,
+            preview: input.assistantBody.slice(0, 160) || input.userBody.slice(0, 160),
+            summary: activePhase ? `${activePhase.name} session` : "Project session",
+            updatedAt: now
+          }
+        }
+
+        return item.status === "active" ? { ...item, status: "idle" as const } : item
+      }),
+      sessionMessages: [...input.state.sessionMessages, userMessage, assistantMessage],
+      activeSessionIdByProject: {
+        ...input.state.activeSessionIdByProject,
+        [input.project.id]: input.session.id
+      }
+    },
+    input.project.id
+  )
+
+  await writeStoreState(nextState)
+
+  return {
+    dashboard: await buildDashboardData(nextState),
+    messages: nextState.sessionMessages
+      .filter((message) => message.sessionId === input.session.id)
+      .sort((left, right) => left.createdAt.localeCompare(right.createdAt))
+  }
+}
+
+const appendSessionTurnToState = (input: {
+  state: StoreState
+  project: ProjectRecord
+  session: SessionRecord
+  workflow: WorkflowState
+  userBody: string
+  assistantBody: string
+  assistantLabel?: string
+  userRole?: SessionMessageRole
+  userLabel?: string
+}): StoreState => {
+  const now = new Date().toISOString()
+  const activePhase = getActiveOrFocusedPhase(input.workflow)
+  const userMessage: SessionMessageRecord = {
+    id: randomUUID(),
+    sessionId: input.session.id,
+    role: input.userRole ?? "user",
+    label: input.userLabel ?? "You",
+    body: input.userBody,
+    chips: [],
+    createdAt: now
+  }
+
+  const assistantMessage: SessionMessageRecord = {
+    id: randomUUID(),
+    sessionId: input.session.id,
+    role: "assistant",
+    label: input.assistantLabel ?? activePhase?.name ?? "Assistant",
+    body: input.assistantBody,
+    chips: [],
+    createdAt: new Date(Date.now() + 1).toISOString()
+  }
+
+  return updateProjectTimestamp(
+    {
+      ...input.state,
+      sessions: input.state.sessions.map((item) => {
+        if (item.projectId !== input.project.id) {
+          return item
+        }
+
+        if (item.id === input.session.id) {
+          return {
+            ...item,
+            codexConversationId:
+              input.session.codexConversationId === undefined
+                ? item.codexConversationId
+                : input.session.codexConversationId,
+            codexRolloutPath:
+              input.session.codexRolloutPath === undefined
+                ? item.codexRolloutPath
+                : input.session.codexRolloutPath,
+            selectedAgentId: input.session.selectedAgentId,
+            selectedModel: input.session.selectedModel,
+            status: "active" as const,
+            preview: input.assistantBody.slice(0, 160) || input.userBody.slice(0, 160),
+            summary: activePhase ? `${activePhase.name} session` : "Project session",
+            updatedAt: now
+          }
+        }
+
+        return item.status === "active" ? { ...item, status: "idle" as const } : item
+      }),
+      sessionMessages: [...input.state.sessionMessages, userMessage, assistantMessage],
+      activeSessionIdByProject: {
+        ...input.state.activeSessionIdByProject,
+        [input.project.id]: input.session.id
+      }
+    },
+    input.project.id
+  )
+}
+
+const executeWorkflowTool = async (input: {
+  state: StoreState
+  project: ProjectRecord
+  session: SessionRecord
+  workflow: WorkflowState
+  command: { name: string; args: string[] }
+  rawBody: string
+}): Promise<SendSessionMessageResult> => {
+  const { project, session, command, rawBody } = input
+  let workflow = input.workflow
+  let uiAction: ToolUiAction = null
+  let assistantBody = ""
+
+  switch (command.name) {
+    case "sdlc_start": {
+      const now = new Date().toISOString()
+      workflow.activePhaseId = "discovery"
+      workflow.phases = workflow.phases.map((phase, index) => ({
+        ...phase,
+        status: index === 0 ? "running" : "not_started",
+        lastUpdatedAt: now
+      }))
+      const synced = await syncWorkflowArtifacts(project, workflow)
+      workflow = synced.workflow
+      await writeWorkflowState(project.workflowPath, workflow)
+
+      let nextState = input.state
+      const phaseSessionState = ensureActivePhaseSession(nextState, project, workflow)
+      nextState = phaseSessionState.state
+      const nextSession =
+        nextState.sessions.find((item) => item.id === phaseSessionState.activeSessionId) ?? session
+      assistantBody =
+        "SDLC workflow reset to Discovery. Review `.project-workflow/discovery/requirements.md` as the first artifact and continue in the Discovery session."
+      const persisted = await persistSessionTurn({
+        state: nextState,
+        project,
+        session: nextSession,
+        workflow,
+        userBody: rawBody,
+        assistantBody,
+        assistantLabel: "SDLC Tool"
+      })
+
+      return {
+        ...persisted,
+        uiAction: {
+          type: "open_file",
+          relativePath: getPrimaryArtifactForPhase(workflow, "discovery"),
+          targetTab: "files"
+        }
+      }
+    }
+
+    case "phase_approve": {
+      const phase = findPhase(workflow, command.args[0])
+      if (!phase) {
+        throw new Error("Phase not found")
+      }
+      const dashboard = await updatePhaseStatus(project.id, phase.id, "approved")
+      const refreshedState = await readStoreState()
+      const refreshedProject = getProjectFromState(refreshedState, project.id)
+      const refreshedWorkflow = await readWorkflowState(refreshedProject.workflowPath)
+      const refreshedSession =
+        refreshedState.sessions.find(
+          (item) =>
+            item.id === refreshedState.activeSessionIdByProject[project.id] &&
+            item.projectId === project.id
+        ) ?? session
+
+      const persisted = await persistSessionTurn({
+        state: refreshedState,
+        project: refreshedProject,
+        session: refreshedSession,
+        workflow: refreshedWorkflow,
+        userBody: rawBody,
+        assistantBody: `${phase.name} approved. ${
+          findPhase(refreshedWorkflow, refreshedWorkflow.activePhaseId)?.name ?? "Next phase"
+        } is now active.`,
+        assistantLabel: "SDLC Tool"
+      })
+
+      return {
+        ...persisted,
+        dashboard
+      }
+    }
+
+    case "phase_request_changes": {
+      const phase = findPhase(workflow, command.args[0])
+      if (!phase) {
+        throw new Error("Phase not found")
+      }
+
+      const dashboard = await updatePhaseStatus(project.id, phase.id, "changes_requested")
+      const refreshedState = await readStoreState()
+      const refreshedWorkflow = await readWorkflowState(project.workflowPath)
+      const refreshedSession =
+        refreshedState.sessions.find(
+          (item) =>
+            item.id === refreshedState.activeSessionIdByProject[project.id] &&
+            item.projectId === project.id
+        ) ?? session
+
+      const persisted = await persistSessionTurn({
+        state: refreshedState,
+        project,
+        session: refreshedSession,
+        workflow: refreshedWorkflow,
+        userBody: rawBody,
+        assistantBody: `${phase.name} marked as changes requested. Keep working in this phase until the artifact is ready again.`,
+        assistantLabel: "SDLC Tool"
+      })
+
+      return {
+        ...persisted,
+        dashboard
+      }
+    }
+
+    case "phase_exit_to_next": {
+      const phase = findPhase(workflow, command.args[0])
+      if (!phase) {
+        throw new Error("Phase not found")
+      }
+
+      const dashboard = await updatePhaseStatus(project.id, phase.id, "review_ready")
+      const refreshedState = await readStoreState()
+      const refreshedWorkflow = await readWorkflowState(project.workflowPath)
+      const persisted = await persistSessionTurn({
+        state: refreshedState,
+        project,
+        session,
+        workflow: refreshedWorkflow,
+        userBody: rawBody,
+        assistantBody: `${phase.name} is now marked review ready. Open ${getPrimaryArtifactForPhase(
+          refreshedWorkflow,
+          phase.id
+        )} and approve or request changes from the SDLC panel.`,
+        assistantLabel: "SDLC Tool"
+      })
+
+      return {
+        ...persisted,
+        dashboard,
+        uiAction: {
+          type: "open_file",
+          relativePath: getPrimaryArtifactForPhase(refreshedWorkflow, phase.id),
+          targetTab: "files"
+        }
+      }
+    }
+
+    case "artifact_list": {
+      const phase = findPhase(workflow, command.args[0])
+      const artifacts = phase
+        ? workflow.artifacts.filter((artifact) => artifact.phaseId === phase.id)
+        : workflow.artifacts
+
+      assistantBody =
+        artifacts.length > 0
+          ? `Artifacts${phase ? ` for ${phase.name}` : ""}:\n${artifacts
+              .map((artifact) => `- ${artifact.path}`)
+              .join("\n")}`
+          : `No artifacts found${phase ? ` for ${phase.name}` : ""}.`
+
+      return persistSessionTurn({
+        state: input.state,
+        project,
+        session,
+        workflow,
+        userBody: rawBody,
+        assistantBody,
+        assistantLabel: "SDLC Tool"
+      })
+    }
+
+    case "artifact_open": {
+      const token = command.args.join(" ").trim()
+      if (!token) {
+        throw new Error("Provide a phase name or relative artifact path")
+      }
+
+      const phase = findPhase(workflow, token)
+      const relativePath = phase
+        ? getPrimaryArtifactForPhase(workflow, phase.id)
+        : token.replace(/^\/+/, "")
+
+      const file = await readWorkspaceFile(project.id, relativePath)
+      if (file.kind === "not_found") {
+        throw new Error(`Artifact not found: ${relativePath}`)
+      }
+
+      assistantBody = `Opened ${relativePath}. Use the Files tab to inspect it in the workspace.`
+      const persisted = await persistSessionTurn({
+        state: input.state,
+        project,
+        session,
+        workflow,
+        userBody: rawBody,
+        assistantBody,
+        assistantLabel: "SDLC Tool"
+      })
+
+      return {
+        ...persisted,
+        uiAction: {
+          type: "open_file",
+          relativePath,
+          targetTab: "files"
+        }
+      }
+    }
+
+    default:
+      throw new Error(
+        "Unknown tool. Available commands: /sdlc_start, /phase_approve, /phase_request_changes, /phase_exit_to_next, /artifact_list, /artifact_open"
+      )
+  }
+}
+
+const ensureActivePhaseSession = (
+  state: StoreState,
+  project: ProjectRecord,
+  workflow: WorkflowState,
+  options?: {
+    selectedModel?: string | null
+  }
+): {
+  state: StoreState
+  activeSessionId: string | null
+  changed: boolean
+} => {
+  const activePhase = getActiveOrFocusedPhase(workflow)
+
+  if (!activePhase) {
+    return {
+      state,
+      activeSessionId: state.activeSessionIdByProject[project.id] ?? null,
+      changed: false
+    }
+  }
+
+  const phaseSeed = getSessionSeedForPhase(project, activePhase.id)
+  if (!phaseSeed) {
+    return {
+      state,
+      activeSessionId: state.activeSessionIdByProject[project.id] ?? null,
+      changed: false
+    }
+  }
+
+  const projectSessions = getSessionsForProject(state, project.id)
+  const existingPhaseSession = projectSessions.find(
+    (session) =>
+      session.kind === phaseSeed.kind &&
+      session.title.trim().toLowerCase() === phaseSeed.title.trim().toLowerCase()
+  )
+
+  if (existingPhaseSession) {
+    const nextState = {
+      ...state,
+      sessions: state.sessions.map((session) => {
+        if (session.projectId !== project.id) {
+          return session
+        }
+
+        if (session.id === existingPhaseSession.id) {
+          return {
+            ...session,
+            status: "active" as const,
+            title: phaseSeed.title,
+            titleSource: "seeded" as const,
+            summary: phaseSeed.summary,
+            preview: phaseSeed.preview,
+            selectedAgentId: activePhase.id,
+            selectedModel:
+              options?.selectedModel === undefined ? session.selectedModel : options.selectedModel,
+            codexConversationId:
+              options?.selectedModel === undefined ? session.codexConversationId : null,
+            codexRolloutPath:
+              options?.selectedModel === undefined ? session.codexRolloutPath : null,
+            updatedAt: new Date().toISOString()
+          }
+        }
+
+        return session.status === "active" ? { ...session, status: "idle" as const } : session
+      }),
+      activeSessionIdByProject: {
+        ...state.activeSessionIdByProject,
+        [project.id]: existingPhaseSession.id
+      }
+    }
+
+    return {
+      state: nextState,
+      activeSessionId: existingPhaseSession.id,
+      changed: true
+    }
+  }
+
+  const created = createSessionRecord(project, phaseSeed.title, {
+    kind: phaseSeed.kind,
+    status: "active",
+    summary: phaseSeed.summary,
+    preview: phaseSeed.preview,
+    titleSource: "seeded"
+  })
+  created.selectedAgentId = activePhase.id
+  created.selectedModel = options?.selectedModel ?? created.selectedModel
+
+  return {
+    state: {
+      ...state,
+      sessions: [created, ...state.sessions].map((session) =>
+        session.projectId === project.id && session.id !== created.id && session.status === "active"
+          ? { ...session, status: "idle" as const }
+          : session
+      ),
+      activeSessionIdByProject: {
+        ...state.activeSessionIdByProject,
+        [project.id]: created.id
+      }
+    },
+    activeSessionId: created.id,
+    changed: true
+  }
 }
 
 const ensureSessionMessages = (
@@ -905,6 +1792,215 @@ const ensureSessionMessages = (
     messages: seededMessages,
     changed: true
   }
+}
+
+const buildAutomaticPhaseKickoff = (input: {
+  currentPhase: PhaseDefinition
+  nextPhase: PhaseDefinition
+  workflow: WorkflowState
+  reason?: string
+}) => {
+  const currentArtifactPath = getPrimaryArtifactForPhase(input.workflow, input.currentPhase.id)
+  const reasonLine = input.reason ? ` Reason: ${input.reason}.` : ""
+
+  return `${input.currentPhase.name} phase completed.${reasonLine} The primary handoff artifact is at ${currentArtifactPath}. Begin the ${input.nextPhase.name} phase now and continue from those deliverables.`
+}
+
+const runAutomaticPhaseHandoff = async (input: {
+  state: StoreState
+  project: ProjectRecord
+  session: SessionRecord
+  workflow: WorkflowState
+  userBody: string
+  assistantBody: string
+  assistantLabel: string
+  directive: ParsedHandoffDirective
+  selectedModel: string | null
+}): Promise<SendSessionMessageResult> => {
+  const currentPhase = getEffectiveAgentPhaseId(input.session, input.workflow)
+    ? getPhaseDefinition(getEffectiveAgentPhaseId(input.session, input.workflow))
+    : null
+
+  if (!currentPhase) {
+    throw new Error("Automatic handoff is only supported from phase agents")
+  }
+
+  const expectedNextPhaseId = getNextPhaseId(currentPhase.id)
+  if (!expectedNextPhaseId || input.directive.nextAgent !== expectedNextPhaseId) {
+    throw new Error(
+      `Invalid handoff target. ${currentPhase.name} can only hand off to ${getPhaseDefinition(expectedNextPhaseId)?.name ?? "the next phase"}.`
+    )
+  }
+
+  const nextPhase = getPhaseDefinition(input.directive.nextAgent)
+  if (!nextPhase) {
+    throw new Error("Next phase not found")
+  }
+
+  let nextState = appendSessionTurnToState({
+    state: input.state,
+    project: input.project,
+    session: input.session,
+    workflow: input.workflow,
+    userBody: input.userBody,
+    assistantBody:
+      input.assistantBody ||
+      `${currentPhase.name} complete. Handing off automatically to ${nextPhase.name}.`,
+    assistantLabel: input.assistantLabel
+  })
+
+  const now = new Date().toISOString()
+  const transitionedWorkflow: WorkflowState = {
+    ...input.workflow,
+    activePhaseId: nextPhase.id,
+    phases: input.workflow.phases.map((phase) => {
+      if (phase.id === currentPhase.id) {
+        return {
+          ...phase,
+          status: "approved" as const,
+          lastUpdatedAt: now
+        }
+      }
+
+      if (phase.id === nextPhase.id) {
+        return {
+          ...phase,
+          status: "running" as const,
+          lastUpdatedAt: now
+        }
+      }
+
+      return phase
+    }),
+    pendingHandoff: null
+  }
+
+  const syncedWorkflow = await syncWorkflowArtifacts(input.project, transitionedWorkflow)
+  await writeWorkflowState(input.project.workflowPath, syncedWorkflow.workflow)
+
+  const phaseSessionState = ensureActivePhaseSession(nextState, input.project, syncedWorkflow.workflow, {
+    selectedModel: input.selectedModel
+  })
+  nextState = phaseSessionState.state
+  const nextSession =
+    nextState.sessions.find((item) => item.id === phaseSessionState.activeSessionId) ?? input.session
+
+  const nextSessionMessages = ensureSessionMessages(
+    nextState,
+    input.project,
+    syncedWorkflow.workflow,
+    nextSession
+  )
+  nextState = nextSessionMessages.state
+
+  const kickoffBody = buildAutomaticPhaseKickoff({
+    currentPhase,
+    nextPhase,
+    workflow: syncedWorkflow.workflow,
+    reason: input.directive.reason
+  })
+
+  const nextCodexResult = await sendCodexSessionMessage({
+    projectId: input.project.id,
+    sessionId: nextSession.id,
+    body: kickoffBody,
+    cwd: input.project.workspacePath,
+    projectName: input.project.name,
+    projectType: input.project.projectType,
+    workflowMode: input.project.workflowMode,
+    activePhaseId: nextPhase.id,
+    activePhaseName: nextPhase.name,
+    effectiveAgentPhaseId: nextPhase.id,
+    effectiveAgentName: nextPhase.name,
+    selectedAgentId: nextPhase.id,
+    selectedModel: input.selectedModel,
+    activeArtifactPath: getPhaseArtifactRelativePath(nextPhase.id),
+    conversationId: nextSession.codexConversationId ?? null,
+    rolloutPath: nextSession.codexRolloutPath ?? null
+  })
+
+  nextState = appendSessionTurnToState({
+    state: nextState,
+    project: input.project,
+    session: {
+      ...nextSession,
+      codexConversationId: nextCodexResult.conversationId,
+      codexRolloutPath: nextCodexResult.rolloutPath,
+      selectedAgentId: nextPhase.id,
+      selectedModel: input.selectedModel
+    },
+    workflow: syncedWorkflow.workflow,
+    userBody: kickoffBody,
+    userRole: "system",
+    userLabel: "Workflow",
+    assistantBody: nextCodexResult.assistantText,
+    assistantLabel: nextPhase.name
+  })
+
+  await writeStoreState(nextState)
+
+  return {
+    dashboard: await buildDashboardData(nextState),
+    messages: nextState.sessionMessages
+      .filter((message) => message.sessionId === nextSession.id)
+      .sort((left, right) => left.createdAt.localeCompare(right.createdAt)),
+    uiAction: {
+      type: "open_file",
+      relativePath: getPrimaryArtifactForPhase(syncedWorkflow.workflow, nextPhase.id),
+      targetTab: "files"
+    }
+  }
+}
+
+const generateWorkspaceImage = async (input: {
+  project: ProjectRecord
+  directive: ParsedImageDirective
+}): Promise<string> => {
+  const apiKey = resolveImageApiKey()
+
+  if (!apiKey) {
+    throw new Error("Set OPENAI_API_KEY or CODEX_API_KEY to enable wireframe image generation")
+  }
+
+  const outputFilename = normalizeGeneratedImageFilename(input.directive.filename)
+  const outputFormat = path.extname(outputFilename).toLowerCase().replace(/^\./, "") || "png"
+  const relativePath = `.project-workflow/wireframes/${outputFilename}`
+  const absolutePath = fromWorkspaceRelativePath(input.project.workspacePath, relativePath)
+
+  const response = await fetch("https://api.openai.com/v1/images/generations", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      model: "gpt-image-1.5",
+      prompt: input.directive.prompt,
+      size: input.directive.size ?? "1536x1024",
+      quality: input.directive.quality ?? "medium",
+      output_format: outputFormat
+    })
+  })
+
+  if (!response.ok) {
+    const errorText = await response.text().catch(() => "")
+    throw new Error(errorText || `Image generation failed with status ${response.status}`)
+  }
+
+  const payload = (await response.json()) as {
+    data?: Array<{
+      b64_json?: string
+    }>
+  }
+
+  const base64Image = payload.data?.[0]?.b64_json
+  if (!base64Image) {
+    throw new Error("Image generation returned no image data")
+  }
+
+  await ensureDirectory(path.dirname(absolutePath))
+  await fs.writeFile(absolutePath, Buffer.from(base64Image, "base64"))
+  return relativePath
 }
 
 const updateProjectTimestamp = (state: StoreState, projectId: string) => {
@@ -1123,7 +2219,8 @@ export const createProject = async (input: CreateProjectInput): Promise<Dashboar
     kind: sessionSeed.kind,
     status: "active",
     summary: sessionSeed.summary,
-    preview: sessionSeed.preview
+    preview: sessionSeed.preview,
+    titleSource: "seeded"
   })
 
   const nextState: StoreState = {
@@ -1162,17 +2259,25 @@ export const selectProject = async (projectId: string): Promise<DashboardData> =
   return buildDashboardData(nextState)
 }
 
-export const createSession = async (projectId: string, title: string): Promise<DashboardData> => {
-  const trimmedTitle = title.trim()
-
-  if (!trimmedTitle) {
-    throw new Error("Session title is required")
-  }
-
+export const createSession = async (projectId: string, title?: string): Promise<DashboardData> => {
+  const trimmedTitle = title?.trim() ?? ""
   const state = await readStoreState()
   const project = getProjectFromState(state, projectId)
-  const session = createSessionRecord(project, trimmedTitle, {
-    status: "active"
+  const workflow = await readWorkflowState(project.workflowPath)
+  const activePhase = getActiveOrFocusedPhase(workflow)
+  const phaseSeed = getSessionSeedForPhase(project, activePhase?.id)
+  const session = createSessionRecord(project, trimmedTitle || pendingSessionTitle, {
+    status: "active",
+    kind: phaseSeed?.kind ?? "general",
+    summary:
+      trimmedTitle || !phaseSeed
+        ? phaseSeed?.summary
+        : "Start a focused thread. The first message will set the session title.",
+    preview:
+      trimmedTitle || !phaseSeed
+        ? phaseSeed?.preview
+        : "Send the first message to title this session automatically, then rename it anytime.",
+    titleSource: trimmedTitle ? "manual" : "pending_first_message"
   })
 
   const nextState = updateProjectTimestamp(
@@ -1290,6 +2395,55 @@ export const renameSession = async (
           ? {
               ...item,
               title: trimmedTitle,
+              titleSource: "manual" as const,
+              updatedAt: now
+            }
+          : item
+      )
+    },
+    projectId
+  )
+
+  await writeStoreState(nextState)
+  return buildDashboardData(nextState)
+}
+
+export const updateSessionPreferences = async (
+  projectId: string,
+  sessionId: string,
+  input: {
+    selectedModel?: string | null
+    selectedAgentId?: SessionAgentId
+  }
+): Promise<DashboardData> => {
+  const state = await readStoreState()
+  getProjectFromState(state, projectId)
+  const session = getSessionFromState(state, projectId, sessionId)
+  const now = new Date().toISOString()
+
+  const nextSelectedModel =
+    input.selectedModel === undefined ? session.selectedModel : input.selectedModel?.trim() || null
+  const nextSelectedAgentId =
+    input.selectedAgentId === undefined ? session.selectedAgentId : input.selectedAgentId
+
+  if (!isSessionAgentId(nextSelectedAgentId)) {
+    throw new Error("Unsupported session agent")
+  }
+
+  const shouldResetConversation =
+    nextSelectedModel !== session.selectedModel || nextSelectedAgentId !== session.selectedAgentId
+
+  const nextState = updateProjectTimestamp(
+    {
+      ...state,
+      sessions: state.sessions.map((item) =>
+        item.id === sessionId && item.projectId === projectId
+          ? {
+              ...item,
+              selectedModel: nextSelectedModel,
+              selectedAgentId: nextSelectedAgentId,
+              codexConversationId: shouldResetConversation ? null : item.codexConversationId,
+              codexRolloutPath: shouldResetConversation ? null : item.codexRolloutPath,
               updatedAt: now
             }
           : item
@@ -1389,6 +2543,7 @@ export const updatePhaseStatus = async (
         }
       : phase
   )
+  workflow.pendingHandoff = null
 
   if (status === "approved") {
     workflow.activePhaseId = nextPhase?.id ?? null
@@ -1411,7 +2566,13 @@ export const updatePhaseStatus = async (
   const syncedWorkflow = await syncWorkflowArtifacts(project, workflow)
   await writeWorkflowState(project.workflowPath, syncedWorkflow.workflow)
 
-  const nextState = updateProjectTimestamp(state, projectId)
+  let nextState: StoreState = updateProjectTimestamp(state, projectId)
+
+  if (status === "approved") {
+    const phaseSessionState = ensureActivePhaseSession(nextState, project, syncedWorkflow.workflow)
+    nextState = phaseSessionState.state
+  }
+
   await writeStoreState(nextState)
 
   return buildDashboardData(nextState)
@@ -1468,8 +2629,121 @@ export const sendSessionMessage = async (
     syncedWorkflow.workflow,
     session
   )
-  const activePhase = getActiveOrFocusedPhase(syncedWorkflow.workflow)
+  const toolCommand = parseToolCommand(trimmedBody)
+
+  if (toolCommand) {
+    return executeWorkflowTool({
+      state: ensuredMessages.state,
+      project,
+      session,
+      workflow: syncedWorkflow.workflow,
+      command: toolCommand,
+      rawBody: trimmedBody
+    })
+  }
+
+  if (
+    syncedWorkflow.workflow.pendingHandoff &&
+    isAffirmativeHandoffReply(trimmedBody) &&
+    session.projectId === projectId
+  ) {
+    const pendingHandoff = syncedWorkflow.workflow.pendingHandoff
+
+    return runAutomaticPhaseHandoff({
+      state: ensuredMessages.state,
+      project,
+      session,
+      workflow: syncedWorkflow.workflow,
+      userBody: trimmedBody,
+      assistantBody: `Proceeding to ${getPhaseDefinition(pendingHandoff.toPhaseId)?.name ?? "the next phase"}.`,
+      assistantLabel: "Workflow",
+      directive: {
+        nextAgent: pendingHandoff.toPhaseId,
+        reason: pendingHandoff.reason
+      },
+      selectedModel: session.selectedModel
+    })
+  }
+
+  let workflowForTurn = syncedWorkflow.workflow
+
+  if (workflowForTurn.pendingHandoff && isNegativeHandoffReply(trimmedBody)) {
+    const now = new Date().toISOString()
+    workflowForTurn = {
+      ...clearPendingHandoff(workflowForTurn),
+      activePhaseId: workflowForTurn.pendingHandoff.fromPhaseId,
+      phases: workflowForTurn.phases.map((phase) =>
+        phase.id === workflowForTurn.pendingHandoff?.fromPhaseId
+          ? {
+              ...phase,
+              status: "changes_requested" as const,
+              lastUpdatedAt: now
+            }
+          : phase
+      )
+    }
+    await writeWorkflowState(project.workflowPath, workflowForTurn)
+  }
+
+  const activePhase = getActiveOrFocusedPhase(workflowForTurn)
+  const effectiveAgentPhaseId = getEffectiveAgentPhaseId(session, workflowForTurn)
+  const selectedAgentLabel = getSelectedAgentLabel(session, workflowForTurn)
   const now = new Date().toISOString()
+  const codexResult = await sendCodexSessionMessage({
+    projectId,
+    sessionId,
+    body: trimmedBody,
+    cwd: project.workspacePath,
+    projectName: project.name,
+    projectType: project.projectType,
+    workflowMode: project.workflowMode,
+    activePhaseId: (activePhase?.id as PhaseId | undefined) ?? null,
+    activePhaseName: activePhase?.name ?? null,
+    effectiveAgentPhaseId,
+    effectiveAgentName: getPhaseDefinition(effectiveAgentPhaseId)?.name ?? selectedAgentLabel,
+    selectedAgentId: session.selectedAgentId,
+    selectedModel: session.selectedModel,
+    activeArtifactPath: activePhase ? getPhaseArtifactRelativePath(activePhase.id) : null,
+    conversationId: session.codexConversationId ?? null,
+    rolloutPath: session.codexRolloutPath ?? null
+  })
+  const imageDirective = parseImageDirectives(codexResult.assistantText)
+  const handoff = parseHandoffDirective(imageDirective.cleanedText)
+  let cleanedAssistantText =
+    handoff.cleanedText || imageDirective.cleanedText || codexResult.assistantText
+  const generatedImagePaths: string[] = []
+  const imageGenerationErrors: string[] = []
+  let generatedWorkflow = workflowForTurn
+
+  if (imageDirective.directives.length > 0) {
+    for (const directive of imageDirective.directives) {
+      try {
+        const generatedImagePath = await generateWorkspaceImage({
+          project,
+          directive
+        })
+        generatedImagePaths.push(generatedImagePath)
+        const syncedAfterImage = await syncWorkflowArtifacts(project, generatedWorkflow)
+        generatedWorkflow = syncedAfterImage.workflow
+
+        if (syncedAfterImage.changed) {
+          await writeWorkflowState(project.workflowPath, generatedWorkflow)
+        }
+      } catch (imageError) {
+        imageGenerationErrors.push(imageError instanceof Error ? imageError.message : "unknown error")
+      }
+    }
+
+    cleanedAssistantText = [
+      cleanedAssistantText,
+      generatedImagePaths.length > 0 ? formatGeneratedImageSummary(generatedImagePaths) : null,
+      imageGenerationErrors.length > 0
+        ? formatImageGenerationFailureSummary(imageGenerationErrors)
+        : null
+    ]
+      .filter(Boolean)
+      .join("\n\n")
+  }
 
   const userMessage: SessionMessageRecord = {
     id: randomUUID(),
@@ -1477,7 +2751,7 @@ export const sendSessionMessage = async (
     role: "user",
     label: "You",
     body: trimmedBody,
-    chips: activePhase ? [activePhase.name] : [],
+    chips: [],
     createdAt: now
   }
 
@@ -1485,12 +2759,20 @@ export const sendSessionMessage = async (
     id: randomUUID(),
     sessionId,
     role: "assistant",
-    label: "Workspace",
-    body: activePhase
-      ? `Saved to this session. I’m keeping ${activePhase.name} centered in the workspace and the inspector around ${phasePrimaryArtifacts[activePhase.id]}.`
-      : "Saved to this session. I’m keeping the workspace context and artifact trail aligned.",
-    chips: activePhase ? [phasePrimaryArtifacts[activePhase.id]] : [],
+    label: selectedAgentLabel,
+    body: cleanedAssistantText,
+    chips: [],
     createdAt: new Date(Date.now() + 1).toISOString()
+  }
+
+  if (handoff.directive && effectiveAgentPhaseId) {
+    generatedWorkflow = markPhaseReadyForHandoff(
+      generatedWorkflow,
+      effectiveAgentPhaseId,
+      handoff.directive.nextAgent,
+      handoff.directive.reason
+    )
+    await writeWorkflowState(project.workflowPath, generatedWorkflow)
   }
 
   const nextState = updateProjectTimestamp(
@@ -1504,11 +2786,19 @@ export const sendSessionMessage = async (
         if (item.id === sessionId) {
           return {
             ...item,
+            title:
+              item.titleSource === "pending_first_message"
+                ? deriveSessionTitleFromMessage(trimmedBody)
+                : item.title,
+            titleSource:
+              item.titleSource === "pending_first_message" ? "message" : item.titleSource,
             status: "active" as const,
-            preview: trimmedBody.slice(0, 160),
-            summary: activePhase
-              ? `${activePhase.name} discussion updated in this session.`
-              : "Project discussion updated in this session.",
+            preview: cleanedAssistantText.slice(0, 160) || trimmedBody.slice(0, 160),
+            summary: selectedAgentLabel
+              ? `${selectedAgentLabel} session`
+              : "Project session",
+            codexConversationId: codexResult.conversationId,
+            codexRolloutPath: codexResult.rolloutPath,
             updatedAt: now
           }
         }
@@ -1528,7 +2818,14 @@ export const sendSessionMessage = async (
 
   return {
     dashboard: await buildDashboardData(nextState),
-    messages: [...ensuredMessages.messages, userMessage, assistantMessage]
+    messages: [...ensuredMessages.messages, userMessage, assistantMessage],
+    uiAction: generatedImagePaths.length > 0
+      ? {
+          type: "open_file",
+          relativePath: generatedImagePaths[generatedImagePaths.length - 1],
+          targetTab: "files"
+        }
+      : undefined
   }
 }
 
@@ -1590,6 +2887,20 @@ export const readWorkspaceFile = async (
   }
 
   if (stats.size > 1024 * 1024) {
+    const imageDescriptor = getImageFileDescriptor(target.relativePath)
+    if (imageDescriptor) {
+      return {
+        path: target.relativePath,
+        name: path.basename(target.relativePath),
+        kind: imageDescriptor.kind,
+        dataUrl: `data:image/${path
+          .extname(target.relativePath)
+          .toLowerCase()
+          .replace(".", "")
+          .replace("jpg", "jpeg")};base64,${(await fs.readFile(target.absolutePath)).toString("base64")}`
+      }
+    }
+
     return {
       path: target.relativePath,
       name: path.basename(target.relativePath),
@@ -1600,6 +2911,21 @@ export const readWorkspaceFile = async (
   const descriptor = getTextFileDescriptor(target.relativePath)
 
   if (!descriptor) {
+    const imageDescriptor = getImageFileDescriptor(target.relativePath)
+
+    if (imageDescriptor) {
+      return {
+        path: target.relativePath,
+        name: path.basename(target.relativePath),
+        kind: imageDescriptor.kind,
+        dataUrl: `data:image/${path
+          .extname(target.relativePath)
+          .toLowerCase()
+          .replace(".", "")
+          .replace("jpg", "jpeg")};base64,${(await fs.readFile(target.absolutePath)).toString("base64")}`
+      }
+    }
+
     return {
       path: target.relativePath,
       name: path.basename(target.relativePath),
