@@ -12,13 +12,32 @@ const createWindow = async () => {
     height: 900,
     minWidth: 1180,
     minHeight: 760,
-    backgroundColor: "#09111f",
+    backgroundColor: "#f6f1e8",
     titleBarStyle: "hiddenInset",
     webPreferences: {
       preload: path.join(__dirname, "preload.js"),
       contextIsolation: true,
-      nodeIntegration: false
+      nodeIntegration: false,
+      sandbox: false
     }
+  })
+
+  window.webContents.on("did-finish-load", () => {
+    void window.webContents
+      .executeJavaScript(
+        `({
+          href: window.location.href,
+          hasDesktopBridge: Boolean(window.desktopBridge),
+          runtime: window.__CODEX_BUILDATHON__ ?? null
+        })`,
+        true
+      )
+      .then((result) => {
+        console.log("[bridge-check]", result)
+      })
+      .catch((error) => {
+        console.error("[bridge-check:error]", error)
+      })
   })
 
   const devServerUrl = process.env.VITE_DEV_SERVER_URL
@@ -45,6 +64,9 @@ app.whenReady().then(async () => {
   ipcMain.handle("project:get-dashboard-data", desktopBridgeHandlers.getDashboardData)
   ipcMain.handle("project:create", desktopBridgeHandlers.createProject)
   ipcMain.handle("project:select", desktopBridgeHandlers.selectProject)
+  ipcMain.handle("session:create", desktopBridgeHandlers.createSession)
+  ipcMain.handle("session:select", desktopBridgeHandlers.selectSession)
+  ipcMain.handle("directory:pick", desktopBridgeHandlers.pickDirectory)
   ipcMain.handle("workflow:update-phase-status", desktopBridgeHandlers.updatePhaseStatus)
 
   await createWindow()
