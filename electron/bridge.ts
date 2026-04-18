@@ -1,10 +1,18 @@
 import { BrowserWindow, dialog, type IpcMainInvokeEvent, type OpenDialogOptions } from "electron"
 import {
+  archiveSession,
   createProject,
   createSession,
+  deleteSession,
   getDashboardData,
+  getSessionMessages,
+  listWorkspaceEntries,
+  readWorkspaceFile,
+  renameProject,
+  renameSession,
   selectProject,
   selectSession,
+  sendSessionMessage,
   updatePhaseStatus
 } from "./project-service.js"
 
@@ -26,6 +34,26 @@ type DirectoryPickerPayload = {
   defaultPath?: string
 }
 
+type SessionMessagesPayload = {
+  projectId: string
+  sessionId: string
+}
+
+type SendMessagePayload = SessionMessagesPayload & {
+  body: string
+}
+
+type WorkspaceEntriesPayload = {
+  projectId: string
+  relativePath?: string
+  scope: "all" | "changes"
+}
+
+type WorkspaceFilePayload = {
+  projectId: string
+  relativePath: string
+}
+
 export const desktopBridgeHandlers = {
   getDashboardData: async (_event: IpcMainInvokeEvent) => getDashboardData(),
   createProject: async (_event: IpcMainInvokeEvent, payload: CreateProjectPayload) =>
@@ -35,10 +63,34 @@ export const desktopBridgeHandlers = {
     _event: IpcMainInvokeEvent,
     payload: { projectId: string; title: string }
   ) => createSession(payload.projectId, payload.title),
+  renameProject: async (
+    _event: IpcMainInvokeEvent,
+    payload: { projectId: string; name: string }
+  ) => renameProject(payload.projectId, payload.name),
   selectSession: async (
     _event: IpcMainInvokeEvent,
     payload: { projectId: string; sessionId: string }
   ) => selectSession(payload.projectId, payload.sessionId),
+  renameSession: async (
+    _event: IpcMainInvokeEvent,
+    payload: { projectId: string; sessionId: string; title: string }
+  ) => renameSession(payload.projectId, payload.sessionId, payload.title),
+  archiveSession: async (
+    _event: IpcMainInvokeEvent,
+    payload: { projectId: string; sessionId: string }
+  ) => archiveSession(payload.projectId, payload.sessionId),
+  deleteSession: async (
+    _event: IpcMainInvokeEvent,
+    payload: { projectId: string; sessionId: string }
+  ) => deleteSession(payload.projectId, payload.sessionId),
+  getSessionMessages: async (_event: IpcMainInvokeEvent, payload: SessionMessagesPayload) =>
+    getSessionMessages(payload.projectId, payload.sessionId),
+  sendSessionMessage: async (_event: IpcMainInvokeEvent, payload: SendMessagePayload) =>
+    sendSessionMessage(payload.projectId, payload.sessionId, payload.body),
+  listWorkspaceEntries: async (_event: IpcMainInvokeEvent, payload: WorkspaceEntriesPayload) =>
+    listWorkspaceEntries(payload.projectId, payload.relativePath, payload.scope),
+  readWorkspaceFile: async (_event: IpcMainInvokeEvent, payload: WorkspaceFilePayload) =>
+    readWorkspaceFile(payload.projectId, payload.relativePath),
   pickDirectory: async (_event: IpcMainInvokeEvent, payload?: DirectoryPickerPayload) => {
     const parentWindow = BrowserWindow.fromWebContents(_event.sender) ?? undefined
     const options: OpenDialogOptions = {

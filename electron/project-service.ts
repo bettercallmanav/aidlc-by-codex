@@ -7,6 +7,7 @@ type ProjectType = "new_project" | "existing_codebase"
 type WorkflowMode = "full_sdlc" | "scaffold_first" | "analyze_existing"
 type SessionKind = "setup" | "analysis" | "discovery" | "architecture" | "implementation" | "general"
 type SessionStatus = "active" | "idle" | "archived"
+type SessionMessageRole = "system" | "user" | "assistant"
 type PhaseStatus =
   | "not_started"
   | "running"
@@ -14,6 +15,16 @@ type PhaseStatus =
   | "approved"
   | "changes_requested"
   | "failed"
+type WorkspaceScope = "all" | "changes"
+type WorkspaceEntryKind = "markdown" | "json" | "code" | "text" | "other"
+type WorkspaceFileKind =
+  | "markdown"
+  | "json"
+  | "code"
+  | "text"
+  | "directory"
+  | "unsupported"
+  | "not_found"
 
 type PhaseDefinition = {
   id: string
@@ -58,6 +69,16 @@ type SessionRecord = {
   updatedAt: string
 }
 
+type SessionMessageRecord = {
+  id: string
+  sessionId: string
+  role: SessionMessageRole
+  label: string
+  body: string
+  chips: string[]
+  createdAt: string
+}
+
 type WorkflowState = {
   projectId: string
   activePhaseId: string | null
@@ -65,9 +86,26 @@ type WorkflowState = {
   artifacts: ArtifactRecord[]
 }
 
+type WorkspaceEntry = {
+  name: string
+  path: string
+  type: "directory" | "file"
+  kind?: WorkspaceEntryKind
+  children?: WorkspaceEntry[]
+}
+
+type WorkspaceFileContent = {
+  path: string
+  name: string
+  kind: WorkspaceFileKind
+  language?: string
+  content?: string
+}
+
 type StoreState = {
   projects: ProjectRecord[]
   sessions: SessionRecord[]
+  sessionMessages: SessionMessageRecord[]
   activeProjectId: string | null
   activeSessionIdByProject: Record<string, string>
 }
@@ -85,6 +123,12 @@ type DashboardData = {
   workflow: WorkflowState | null
   sessions: SessionRecord[]
   activeSession: SessionRecord | null
+  allSessions: SessionRecord[]
+}
+
+type SendSessionMessageResult = {
+  dashboard: DashboardData
+  messages: SessionMessageRecord[]
 }
 
 const phaseDefinitions: PhaseDefinition[] = [
@@ -141,6 +185,56 @@ const workflowFolderNames: Record<string, string> = {
   handover: "handover"
 }
 
+const phasePrimaryArtifacts: Record<string, string> = {
+  discovery: "requirements.md",
+  architecture: "architecture.md",
+  journey: "user-journeys.md",
+  wireframe: "wireframes.md",
+  coder: "implementation-summary.md",
+  testing: "test-plan.md",
+  devops: "deployment-guide.md",
+  handover: "client-handover.md"
+}
+
+const ignoredWorkspaceEntries = new Set([
+  ".DS_Store",
+  ".git",
+  "coverage",
+  "dist",
+  "dist-electron",
+  "node_modules"
+])
+
+const textExtensionMap: Record<
+  string,
+  {
+    kind: Exclude<WorkspaceFileKind, "directory" | "unsupported" | "not_found">
+    language?: string
+  }
+> = {
+  ".css": { kind: "code", language: "css" },
+  ".html": { kind: "code", language: "html" },
+  ".js": { kind: "code", language: "javascript" },
+  ".json": { kind: "json", language: "json" },
+  ".jsx": { kind: "code", language: "jsx" },
+  ".md": { kind: "markdown", language: "markdown" },
+  ".mjs": { kind: "code", language: "javascript" },
+  ".ts": { kind: "code", language: "typescript" },
+  ".tsx": { kind: "code", language: "tsx" },
+  ".txt": { kind: "text", language: "text" }
+}
+
+const workflowModeLabels: Record<WorkflowMode, string> = {
+  full_sdlc: "Full SDLC workflow",
+  scaffold_first: "Scaffold-first flow",
+  analyze_existing: "Analyze existing codebase"
+}
+
+const projectTypeLabels: Record<ProjectType, string> = {
+  new_project: "New project",
+  existing_codebase: "Imported existing folder"
+}
+
 const slugify = (value: string) =>
   value
     .toLowerCase()
@@ -175,6 +269,37 @@ const getDefaultProjectsBasePath = () =>
   path.join(app.getPath("documents"), "Codex Buildathon Projects")
 
 const getWorkflowStatePath = (workflowPath: string) => path.join(workflowPath, "workflow-state.json")
+
+const normalizeRelativePath = (value: string | undefined) =>
+  (value ?? "").replace(/\\/g, "/").replace(/^\/+/, "").replace(/\/+$/, "")
+
+const toWorkspaceRelativePath = (workspacePath: string, absolutePath: string) =>
+  path.relative(workspacePath, absolutePath).split(path.sep).join("/")
+
+const fromWorkspaceRelativePath = (workspacePath: string, relativePath: string) =>
+  path.join(workspacePath, ...normalizeRelativePath(relativePath).split("/").filter(Boolean))
+
+const resolveWorkspaceTarget = (workspacePath: string, relativePath?: string) => {
+  const basePath = path.resolve(workspacePath)
+  const normalizedRelativePath = normalizeRelativePath(relativePath)
+  const absolutePath = path.resolve(basePath, normalizedRelativePath)
+
+  if (absolutePath !== basePath && !absolutePath.startsWith(`${basePath}${path.sep}`)) {
+    throw new Error("Path must stay inside the project workspace")
+  }
+
+  return {
+    basePath,
+    absolutePath,
+    relativePath: normalizedRelativePath
+  }
+}
+
+const getPhaseFolderRelativePath = (phaseId: string) =>
+  `.project-workflow/${workflowFolderNames[phaseId] ?? phaseId}`
+
+const getPhaseArtifactRelativePath = (phaseId: string) =>
+  `${getPhaseFolderRelativePath(phaseId)}/${phasePrimaryArtifacts[phaseId] ?? "artifact.md"}`
 
 const buildInitialWorkflowState = (projectId: string): WorkflowState => {
   const now = new Date().toISOString()
@@ -219,14 +344,20 @@ const normalizeProject = (project: Partial<ProjectRecord>): ProjectRecord | null
   const projectType =
     project.projectType === "existing_codebase" ? "existing_codebase" : "new_project"
 
+  const workflowMode =
+    project.workflowMode &&
+    ["full_sdlc", "scaffold_first", "analyze_existing"].includes(project.workflowMode)
+      ? project.workflowMode
+      : projectType === "existing_codebase"
+        ? "analyze_existing"
+        : "full_sdlc"
+
   return {
     id: project.id,
     name: project.name,
     slug: project.slug,
     projectType,
-    workflowMode:
-      project.workflowMode ??
-      (projectType === "existing_codebase" ? "analyze_existing" : "full_sdlc"),
+    workflowMode,
     workspacePath: project.workspacePath,
     workflowPath: project.workflowPath,
     createdAt: project.createdAt ?? new Date().toISOString(),
@@ -265,13 +396,38 @@ const normalizeSession = (session: Partial<SessionRecord>): SessionRecord | null
   }
 }
 
+const normalizeMessage = (message: Partial<SessionMessageRecord>): SessionMessageRecord | null => {
+  if (!message.id || !message.sessionId || !message.role || !message.label || !message.body) {
+    return null
+  }
+
+  const role: SessionMessageRole =
+    ["system", "user", "assistant"].includes(message.role) ? message.role : "assistant"
+
+  return {
+    id: message.id,
+    sessionId: message.sessionId,
+    role,
+    label: message.label,
+    body: message.body,
+    chips: Array.isArray(message.chips)
+      ? message.chips.filter((chip): chip is string => typeof chip === "string")
+      : [],
+    createdAt: message.createdAt ?? new Date().toISOString()
+  }
+}
+
 const normalizeStoreState = (state: Partial<StoreState> | null | undefined): StoreState => {
   const projects = (state?.projects ?? []).map(normalizeProject).filter(Boolean) as ProjectRecord[]
   const sessions = (state?.sessions ?? []).map(normalizeSession).filter(Boolean) as SessionRecord[]
+  const sessionMessages = (state?.sessionMessages ?? [])
+    .map(normalizeMessage)
+    .filter(Boolean) as SessionMessageRecord[]
 
   return {
     projects,
     sessions,
+    sessionMessages,
     activeProjectId:
       state?.activeProjectId && projects.some((project) => project.id === state.activeProjectId)
         ? state.activeProjectId
@@ -284,6 +440,7 @@ const readStoreState = async (): Promise<StoreState> => {
   const rawState = await readJsonFile<Partial<StoreState>>(getStoreFilePath(), {
     projects: [],
     sessions: [],
+    sessionMessages: [],
     activeProjectId: null,
     activeSessionIdByProject: {}
   })
@@ -311,76 +468,48 @@ const writeFileIfMissing = async (filePath: string, value: string) => {
     return
   }
 
+  await ensureDirectory(path.dirname(filePath))
   await fs.writeFile(filePath, value, "utf8")
 }
 
-const initializeWorkspace = async (
-  project: ProjectRecord,
-  workflowState: WorkflowState
-) => {
-  await ensureDirectory(project.workspacePath)
-  await ensureDirectory(project.workflowPath)
+const inferArtifactKind = (relativePath: string): ArtifactRecord["kind"] => {
+  const extension = path.extname(relativePath).toLowerCase()
 
-  for (const folderName of Object.values(workflowFolderNames)) {
-    await ensureDirectory(path.join(project.workflowPath, folderName))
+  if (extension === ".md") {
+    return "markdown"
   }
 
-  await writeWorkflowState(project.workflowPath, workflowState)
-  await writeJsonFile(path.join(project.workflowPath, "project-context.json"), {
-    id: project.id,
-    name: project.name,
-    slug: project.slug,
-    projectType: project.projectType,
-    workflowMode: project.workflowMode,
-    workspacePath: project.workspacePath,
-    workflowPath: project.workflowPath,
-    createdAt: project.createdAt,
-    updatedAt: project.updatedAt
-  })
-
-  if (project.projectType === "new_project") {
-    await writeFileIfMissing(
-      path.join(project.workspacePath, "README.md"),
-      `# ${project.name}
-
-This project workspace was created by Codex Buildathon.
-
-## Workflow
-
-- Project type: New project
-- Mode: ${project.workflowMode}
-- Workflow state: .project-workflow/workflow-state.json
-- Artifacts: .project-workflow/
-
-## Next step
-
-Open the project in the desktop app and start the Discovery session.
-`
-    )
+  if (extension === ".json") {
+    return "json"
   }
+
+  if ([".css", ".html", ".js", ".jsx", ".mjs", ".ts", ".tsx"].includes(extension)) {
+    return "code"
+  }
+
+  return "other"
 }
 
-const resolveWorkspacePath = async (input: CreateProjectInput, slug: string) => {
-  const trimmedWorkspacePath = input.workspacePath?.trim()
+const inferWorkspaceEntryKind = (relativePath: string): WorkspaceEntryKind => {
+  const artifactKind = inferArtifactKind(relativePath)
 
-  if (input.projectType === "existing_codebase") {
-    if (!trimmedWorkspacePath) {
-      throw new Error("Importing an existing codebase requires a folder path")
-    }
-
-    const resolvedPath = path.resolve(trimmedWorkspacePath)
-    await assertDirectory(resolvedPath)
-    return resolvedPath
+  if (artifactKind === "other" && path.extname(relativePath).toLowerCase() === ".txt") {
+    return "text"
   }
 
-  if (trimmedWorkspacePath) {
-    return path.join(path.resolve(trimmedWorkspacePath), slug)
-  }
-
-  const defaultBasePath = getDefaultProjectsBasePath()
-  await ensureDirectory(defaultBasePath)
-  return path.join(defaultBasePath, slug)
+  return artifactKind === "other" ? "other" : artifactKind
 }
+
+const getTextFileDescriptor = (relativePath: string) =>
+  textExtensionMap[path.extname(relativePath).toLowerCase()] ?? null
+
+const getActiveOrFocusedPhase = (workflow: WorkflowState) =>
+  workflow.phases.find((phase) => phase.id === workflow.activePhaseId) ??
+  workflow.phases.find((phase) =>
+    ["running", "review_ready", "changes_requested", "failed"].includes(phase.status)
+  ) ??
+  workflow.phases[0] ??
+  null
 
 const getProjectFromState = (state: StoreState, projectId: string) => {
   const project = state.projects.find((item) => item.id === projectId)
@@ -392,9 +521,19 @@ const getProjectFromState = (state: StoreState, projectId: string) => {
   return project
 }
 
+const getSessionFromState = (state: StoreState, projectId: string, sessionId: string) => {
+  const session = state.sessions.find((item) => item.id === sessionId && item.projectId === projectId)
+
+  if (!session) {
+    throw new Error("Session not found")
+  }
+
+  return session
+}
+
 const getSessionsForProject = (state: StoreState, projectId: string) =>
   state.sessions
-    .filter((session) => session.projectId === projectId)
+    .filter((session) => session.projectId === projectId && session.status !== "archived")
     .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))
 
 const getDefaultSessionSeed = (project: ProjectRecord) => {
@@ -449,6 +588,176 @@ const createSessionRecord = (
     createdAt: now,
     updatedAt: now
   }
+}
+
+const buildPhaseSeedArtifact = (project: ProjectRecord, phase: WorkflowPhase) => `# ${phase.name} - ${project.name}
+
+## Purpose
+${phase.summary}
+
+## Project Context
+- Project type: ${projectTypeLabels[project.projectType]}
+- Workflow mode: ${workflowModeLabels[project.workflowMode]}
+- Workspace root: ${project.workspacePath}
+
+## What This Artifact Will Hold
+- Decisions that belong to ${phase.name}
+- Notes that should remain reviewable outside chat
+- Handoff context for the next phase
+
+## Current Starting Point
+This file was seeded automatically so the workspace has a real artifact surface before Codex execution is wired in.
+`
+
+const ensureSeedArtifactForActivePhase = async (project: ProjectRecord, workflow: WorkflowState) => {
+  const phase = getActiveOrFocusedPhase(workflow)
+
+  if (!phase) {
+    return false
+  }
+
+  const relativePath = getPhaseArtifactRelativePath(phase.id)
+  const absolutePath = fromWorkspaceRelativePath(project.workspacePath, relativePath)
+
+  if (await pathExists(absolutePath)) {
+    return false
+  }
+
+  await ensureDirectory(path.dirname(absolutePath))
+  await fs.writeFile(absolutePath, buildPhaseSeedArtifact(project, phase), "utf8")
+  return true
+}
+
+const listFilesRecursive = async (directoryPath: string): Promise<string[]> => {
+  const entries = await fs.readdir(directoryPath, { withFileTypes: true }).catch(() => [])
+  const files: string[] = []
+
+  for (const entry of entries) {
+    const absolutePath = path.join(directoryPath, entry.name)
+
+    if (entry.isDirectory()) {
+      files.push(...(await listFilesRecursive(absolutePath)))
+      continue
+    }
+
+    if (entry.isFile()) {
+      files.push(absolutePath)
+    }
+  }
+
+  return files
+}
+
+const syncWorkflowArtifacts = async (project: ProjectRecord, workflow: WorkflowState) => {
+  let changed = await ensureSeedArtifactForActivePhase(project, workflow)
+  const existingArtifacts = new Map(workflow.artifacts.map((artifact) => [artifact.path, artifact]))
+  const nextArtifacts: ArtifactRecord[] = []
+
+  for (const phase of phaseDefinitions) {
+    const folderName = workflowFolderNames[phase.id]
+    const phaseDirectory = path.join(project.workflowPath, folderName)
+    const filePaths = await listFilesRecursive(phaseDirectory)
+
+    for (const absoluteFilePath of filePaths) {
+      const relativePath = toWorkspaceRelativePath(project.workspacePath, absoluteFilePath)
+      const existingArtifact = existingArtifacts.get(relativePath)
+      const stats = await fs.stat(absoluteFilePath)
+
+      nextArtifacts.push({
+        id: existingArtifact?.id ?? randomUUID(),
+        phaseId: phase.id,
+        path: relativePath,
+        kind: inferArtifactKind(relativePath),
+        createdAt: existingArtifact?.createdAt ?? stats.birthtime.toISOString()
+      })
+    }
+  }
+
+  nextArtifacts.sort((left, right) => left.path.localeCompare(right.path))
+
+  const hasChangedArtifacts =
+    nextArtifacts.length !== workflow.artifacts.length ||
+    nextArtifacts.some((artifact, index) => {
+      const currentArtifact = workflow.artifacts[index]
+      return (
+        !currentArtifact ||
+        artifact.path !== currentArtifact.path ||
+        artifact.phaseId !== currentArtifact.phaseId ||
+        artifact.kind !== currentArtifact.kind
+      )
+    })
+
+  if (hasChangedArtifacts) {
+    workflow.artifacts = nextArtifacts
+    changed = true
+  }
+
+  return {
+    workflow,
+    changed
+  }
+}
+
+const initializeWorkspace = async (project: ProjectRecord, workflowState: WorkflowState) => {
+  await ensureDirectory(project.workspacePath)
+  await ensureDirectory(project.workflowPath)
+
+  for (const folderName of Object.values(workflowFolderNames)) {
+    await ensureDirectory(path.join(project.workflowPath, folderName))
+  }
+
+  await writeJsonFile(path.join(project.workflowPath, "project-context.json"), {
+    id: project.id,
+    name: project.name,
+    slug: project.slug,
+    projectType: project.projectType,
+    workflowMode: project.workflowMode,
+    workspacePath: project.workspacePath,
+    workflowPath: project.workflowPath,
+    createdAt: project.createdAt,
+    updatedAt: project.updatedAt
+  })
+
+  if (project.projectType === "new_project") {
+    await writeFileIfMissing(
+      path.join(project.workspacePath, "README.md"),
+      `# ${project.name}
+
+This project workspace was created by Codex Buildathon.
+
+## Workflow
+- Project type: ${projectTypeLabels[project.projectType]}
+- Mode: ${workflowModeLabels[project.workflowMode]}
+- Workflow state: .project-workflow/workflow-state.json
+- Artifacts: .project-workflow/
+`
+    )
+  }
+
+  const syncedWorkflow = await syncWorkflowArtifacts(project, workflowState)
+  await writeWorkflowState(project.workflowPath, syncedWorkflow.workflow)
+}
+
+const resolveWorkspacePath = async (input: CreateProjectInput, slug: string) => {
+  const trimmedWorkspacePath = input.workspacePath?.trim()
+
+  if (input.projectType === "existing_codebase") {
+    if (!trimmedWorkspacePath) {
+      throw new Error("Importing an existing codebase requires a folder path")
+    }
+
+    const resolvedPath = path.resolve(trimmedWorkspacePath)
+    await assertDirectory(resolvedPath)
+    return resolvedPath
+  }
+
+  if (trimmedWorkspacePath) {
+    return path.join(path.resolve(trimmedWorkspacePath), slug)
+  }
+
+  const defaultBasePath = getDefaultProjectsBasePath()
+  await ensureDirectory(defaultBasePath)
+  return path.join(defaultBasePath, slug)
 }
 
 const ensureProjectSessions = (state: StoreState, project: ProjectRecord) => {
@@ -519,20 +828,95 @@ const ensureProjectSessions = (state: StoreState, project: ProjectRecord) => {
   }
 }
 
-const touchProject = async (state: StoreState, projectId: string) => {
-  const updatedAt = new Date().toISOString()
-  const projects = state.projects.map((project) =>
-    project.id === projectId ? { ...project, updatedAt } : project
-  )
+const buildSeedMessages = (
+  project: ProjectRecord,
+  workflow: WorkflowState,
+  session: SessionRecord
+): SessionMessageRecord[] => {
+  const now = new Date().toISOString()
+  const activePhase = getActiveOrFocusedPhase(workflow)
+  const kickoffBody =
+    project.workflowMode === "analyze_existing"
+      ? "Import this repo, inspect the existing structure, and tell me the shortest path to a delivery-ready handover."
+      : project.workflowMode === "scaffold_first"
+        ? "Start with a scaffold, keep the workflow trail intact, and move toward useful implementation structure quickly."
+        : "Set up a project workspace where artifacts, approvals, and handoffs stay visible from Discovery through Handover."
 
-  const nextState = {
-    ...state,
-    projects,
-    activeProjectId: projectId
+  const assistantBody = activePhase
+    ? `This session is anchored to ${activePhase.name}. I’ll keep the chat, the workspace files, and the review state aligned around ${phasePrimaryArtifacts[activePhase.id]}.`
+    : "This session is anchored to the shared workspace. I’ll keep the chat and the artifact trail aligned."
+
+  return [
+    {
+      id: randomUUID(),
+      sessionId: session.id,
+      role: "system",
+      label: "Workspace context",
+      body: `${project.name} is running in ${workflowModeLabels[project.workflowMode]} against ${projectTypeLabels[project.projectType].toLowerCase()}. Files live under ${project.workspacePath}.`,
+      chips: [workflowModeLabels[project.workflowMode], projectTypeLabels[project.projectType]],
+      createdAt: now
+    },
+    {
+      id: randomUUID(),
+      sessionId: session.id,
+      role: "user",
+      label: session.title,
+      body: kickoffBody,
+      chips: activePhase ? [activePhase.name] : [],
+      createdAt: now
+    },
+    {
+      id: randomUUID(),
+      sessionId: session.id,
+      role: "assistant",
+      label: "Workspace",
+      body: assistantBody,
+      chips: activePhase ? [phasePrimaryArtifacts[activePhase.id]] : [],
+      createdAt: now
+    }
+  ]
+}
+
+const ensureSessionMessages = (
+  state: StoreState,
+  project: ProjectRecord,
+  workflow: WorkflowState,
+  session: SessionRecord
+) => {
+  const existingMessages = state.sessionMessages
+    .filter((message) => message.sessionId === session.id)
+    .sort((left, right) => left.createdAt.localeCompare(right.createdAt))
+
+  if (existingMessages.length > 0) {
+    return {
+      state,
+      messages: existingMessages,
+      changed: false
+    }
   }
 
-  await writeStoreState(nextState)
-  return nextState
+  const seededMessages = buildSeedMessages(project, workflow, session)
+
+  return {
+    state: {
+      ...state,
+      sessionMessages: [...state.sessionMessages, ...seededMessages]
+    },
+    messages: seededMessages,
+    changed: true
+  }
+}
+
+const updateProjectTimestamp = (state: StoreState, projectId: string) => {
+  const updatedAt = new Date().toISOString()
+
+  return {
+    ...state,
+    projects: state.projects.map((project) =>
+      project.id === projectId ? { ...project, updatedAt } : project
+    ),
+    activeProjectId: projectId
+  }
 }
 
 const buildDashboardData = async (state: StoreState): Promise<DashboardData> => {
@@ -546,25 +930,148 @@ const buildDashboardData = async (state: StoreState): Promise<DashboardData> => 
       activeProject: null,
       workflow: null,
       sessions: [],
-      activeSession: null
+      activeSession: null,
+      allSessions: state.sessions.filter((session) => session.status !== "archived")
     }
   }
 
-  const ensured = ensureProjectSessions(state, activeProject)
+  const ensuredSessions = ensureProjectSessions(state, activeProject)
+  let nextState = ensuredSessions.state
+  let workflow = await readWorkflowState(activeProject.workflowPath)
+  const syncedWorkflow = await syncWorkflowArtifacts(activeProject, workflow)
 
-  if (ensured.changed) {
-    await writeStoreState(ensured.state)
+  workflow = syncedWorkflow.workflow
+
+  if (ensuredSessions.changed) {
+    await writeStoreState(nextState)
   }
 
-  const workflow = await readWorkflowState(activeProject.workflowPath)
+  if (syncedWorkflow.changed) {
+    await writeWorkflowState(activeProject.workflowPath, workflow)
+  }
 
   return {
-    projects: ensured.state.projects,
+    projects: nextState.projects,
     activeProject,
     workflow,
-    sessions: ensured.sessions,
-    activeSession: ensured.activeSession
+    sessions: ensuredSessions.sessions,
+    activeSession: ensuredSessions.activeSession,
+    allSessions: nextState.sessions.filter((session) => session.status !== "archived")
   }
+}
+
+const listEntriesInDirectory = async (
+  workspacePath: string,
+  directoryPath: string,
+  currentRelativePath: string,
+  allowedPaths?: Set<string>
+): Promise<WorkspaceEntry[]> => {
+  const directoryEntries = await fs.readdir(directoryPath, { withFileTypes: true }).catch(() => [])
+
+  const sortedEntries = [...directoryEntries].sort((left, right) => {
+    if (left.isDirectory() !== right.isDirectory()) {
+      return left.isDirectory() ? -1 : 1
+    }
+
+    return left.name.localeCompare(right.name)
+  })
+
+  const results: WorkspaceEntry[] = []
+
+  for (const entry of sortedEntries) {
+    const relativePath = currentRelativePath ? `${currentRelativePath}/${entry.name}` : entry.name
+    const isWorkflowRoot = relativePath === ".project-workflow"
+
+    if (!isWorkflowRoot && ignoredWorkspaceEntries.has(entry.name)) {
+      continue
+    }
+
+    if (allowedPaths) {
+      const hasAllowedDescendant = [...allowedPaths].some(
+        (allowedPath) =>
+          allowedPath === relativePath || allowedPath.startsWith(`${relativePath}/`)
+      )
+
+      if (!hasAllowedDescendant) {
+        continue
+      }
+    }
+
+    const absolutePath = path.join(directoryPath, entry.name)
+
+    if (entry.isDirectory()) {
+      const children = await listEntriesInDirectory(
+        workspacePath,
+        absolutePath,
+        relativePath,
+        allowedPaths
+      )
+
+      results.push({
+        name: entry.name,
+        path: relativePath,
+        type: "directory",
+        children
+      })
+      continue
+    }
+
+    if (!entry.isFile()) {
+      continue
+    }
+
+    results.push({
+      name: entry.name,
+      path: relativePath,
+      type: "file",
+      kind: inferWorkspaceEntryKind(relativePath)
+    })
+  }
+
+  return results
+}
+
+const getChangedWorkspacePaths = async (project: ProjectRecord, workflow: WorkflowState) => {
+  const allowedPaths = new Set<string>(workflow.artifacts.map((artifact) => artifact.path))
+  const activePhase = getActiveOrFocusedPhase(workflow)
+
+  if (!activePhase) {
+    return allowedPaths
+  }
+
+  const phaseDirectory = fromWorkspaceRelativePath(
+    project.workspacePath,
+    getPhaseFolderRelativePath(activePhase.id)
+  )
+  const phaseFiles = await listFilesRecursive(phaseDirectory)
+
+  for (const filePath of phaseFiles) {
+    allowedPaths.add(toWorkspaceRelativePath(project.workspacePath, filePath))
+  }
+
+  const primaryArtifactPath = getPhaseArtifactRelativePath(activePhase.id)
+  const absolutePrimaryArtifactPath = fromWorkspaceRelativePath(project.workspacePath, primaryArtifactPath)
+
+  if (await pathExists(absolutePrimaryArtifactPath)) {
+    allowedPaths.add(primaryArtifactPath)
+  }
+
+  return allowedPaths
+}
+
+const initializeMessageAwareState = async (
+  state: StoreState,
+  project: ProjectRecord,
+  workflow: WorkflowState,
+  session: SessionRecord
+) => {
+  const ensuredMessages = ensureSessionMessages(state, project, workflow, session)
+
+  if (ensuredMessages.changed) {
+    await writeStoreState(ensuredMessages.state)
+  }
+
+  return ensuredMessages
 }
 
 export const createProject = async (input: CreateProjectInput): Promise<DashboardData> => {
@@ -622,6 +1129,7 @@ export const createProject = async (input: CreateProjectInput): Promise<Dashboar
   const nextState: StoreState = {
     projects: [project, ...state.projects],
     sessions: [initialSession, ...state.sessions],
+    sessionMessages: state.sessionMessages,
     activeProjectId: projectId,
     activeSessionIdByProject: {
       ...state.activeSessionIdByProject,
@@ -631,13 +1139,7 @@ export const createProject = async (input: CreateProjectInput): Promise<Dashboar
 
   await writeStoreState(nextState)
 
-  return {
-    projects: nextState.projects,
-    activeProject: project,
-    workflow,
-    sessions: [initialSession],
-    activeSession: initialSession
-  }
+  return buildDashboardData(nextState)
 }
 
 export const getDashboardData = async (): Promise<DashboardData> => {
@@ -648,11 +1150,13 @@ export const getDashboardData = async (): Promise<DashboardData> => {
 export const selectProject = async (projectId: string): Promise<DashboardData> => {
   const state = await readStoreState()
   getProjectFromState(state, projectId)
-
-  const nextState = {
-    ...state,
-    activeProjectId: projectId
-  }
+  const nextState = updateProjectTimestamp(
+    {
+      ...state,
+      activeProjectId: projectId
+    },
+    projectId
+  )
 
   await writeStoreState(nextState)
   return buildDashboardData(nextState)
@@ -671,7 +1175,7 @@ export const createSession = async (projectId: string, title: string): Promise<D
     status: "active"
   })
 
-  const nextState = await touchProject(
+  const nextState = updateProjectTimestamp(
     {
       ...state,
       sessions: [session, ...state.sessions].map((item) =>
@@ -687,6 +1191,7 @@ export const createSession = async (projectId: string, title: string): Promise<D
     projectId
   )
 
+  await writeStoreState(nextState)
   return buildDashboardData(nextState)
 }
 
@@ -696,14 +1201,10 @@ export const selectSession = async (
 ): Promise<DashboardData> => {
   const state = await readStoreState()
   getProjectFromState(state, projectId)
-  const session = state.sessions.find((item) => item.id === sessionId && item.projectId === projectId)
-
-  if (!session) {
-    throw new Error("Session not found")
-  }
-
+  getSessionFromState(state, projectId, sessionId)
   const now = new Date().toISOString()
-  const nextState = await touchProject(
+
+  const nextState = updateProjectTimestamp(
     {
       ...state,
       sessions: state.sessions.map((item) => {
@@ -729,6 +1230,136 @@ export const selectSession = async (
     projectId
   )
 
+  await writeStoreState(nextState)
+  return buildDashboardData(nextState)
+}
+
+export const renameProject = async (
+  projectId: string,
+  name: string
+): Promise<DashboardData> => {
+  const trimmedName = name.trim()
+
+  if (!trimmedName) {
+    throw new Error("Project name is required")
+  }
+
+  const state = await readStoreState()
+  getProjectFromState(state, projectId)
+  const updatedAt = new Date().toISOString()
+
+  const nextState: StoreState = {
+    ...state,
+    projects: state.projects.map((project) =>
+      project.id === projectId
+        ? {
+            ...project,
+            name: trimmedName,
+            updatedAt
+          }
+        : project
+    ),
+    activeProjectId: projectId
+  }
+
+  await writeStoreState(nextState)
+  return buildDashboardData(nextState)
+}
+
+export const renameSession = async (
+  projectId: string,
+  sessionId: string,
+  title: string
+): Promise<DashboardData> => {
+  const trimmedTitle = title.trim()
+
+  if (!trimmedTitle) {
+    throw new Error("Session title is required")
+  }
+
+  const state = await readStoreState()
+  getProjectFromState(state, projectId)
+  getSessionFromState(state, projectId, sessionId)
+  const now = new Date().toISOString()
+
+  const nextState = updateProjectTimestamp(
+    {
+      ...state,
+      sessions: state.sessions.map((item) =>
+        item.id === sessionId
+          ? {
+              ...item,
+              title: trimmedTitle,
+              updatedAt: now
+            }
+          : item
+      )
+    },
+    projectId
+  )
+
+  await writeStoreState(nextState)
+  return buildDashboardData(nextState)
+}
+
+export const archiveSession = async (
+  projectId: string,
+  sessionId: string
+): Promise<DashboardData> => {
+  const state = await readStoreState()
+  getProjectFromState(state, projectId)
+  getSessionFromState(state, projectId, sessionId)
+
+  const nextState = updateProjectTimestamp(
+    {
+      ...state,
+      sessions: state.sessions.map((item) =>
+        item.id === sessionId
+          ? {
+              ...item,
+              status: "archived" as const,
+              updatedAt: new Date().toISOString()
+            }
+          : item
+      ),
+      activeSessionIdByProject:
+        state.activeSessionIdByProject[projectId] === sessionId
+          ? Object.fromEntries(
+              Object.entries(state.activeSessionIdByProject).filter(([key]) => key !== projectId)
+            )
+          : state.activeSessionIdByProject
+    },
+    projectId
+  )
+
+  await writeStoreState(nextState)
+  return buildDashboardData(nextState)
+}
+
+export const deleteSession = async (
+  projectId: string,
+  sessionId: string
+): Promise<DashboardData> => {
+  const state = await readStoreState()
+  getProjectFromState(state, projectId)
+  getSessionFromState(state, projectId, sessionId)
+
+  const nextState = updateProjectTimestamp(
+    {
+      ...state,
+      sessions: state.sessions.filter((item) => item.id !== sessionId),
+      sessionMessages: state.sessionMessages.filter((message) => message.sessionId !== sessionId),
+      activeSessionIdByProject:
+        state.activeSessionIdByProject[projectId] === sessionId
+          ? Object.fromEntries(
+              Object.entries(state.activeSessionIdByProject).filter(([key]) => key !== projectId)
+            )
+          : state.activeSessionIdByProject
+    },
+    projectId
+  )
+
+  await writeStoreState(nextState)
   return buildDashboardData(nextState)
 }
 
@@ -777,8 +1408,210 @@ export const updatePhaseStatus = async (
     workflow.activePhaseId = phaseId
   }
 
-  await writeWorkflowState(project.workflowPath, workflow)
-  const nextState = await touchProject(state, projectId)
+  const syncedWorkflow = await syncWorkflowArtifacts(project, workflow)
+  await writeWorkflowState(project.workflowPath, syncedWorkflow.workflow)
+
+  const nextState = updateProjectTimestamp(state, projectId)
+  await writeStoreState(nextState)
 
   return buildDashboardData(nextState)
+}
+
+export const getSessionMessages = async (
+  projectId: string,
+  sessionId: string
+): Promise<SessionMessageRecord[]> => {
+  const state = await readStoreState()
+  const project = getProjectFromState(state, projectId)
+  const session = getSessionFromState(state, projectId, sessionId)
+  const workflow = await readWorkflowState(project.workflowPath)
+  const syncedWorkflow = await syncWorkflowArtifacts(project, workflow)
+
+  if (syncedWorkflow.changed) {
+    await writeWorkflowState(project.workflowPath, syncedWorkflow.workflow)
+  }
+
+  const ensuredMessages = await initializeMessageAwareState(
+    state,
+    project,
+    syncedWorkflow.workflow,
+    session
+  )
+
+  return ensuredMessages.messages
+}
+
+export const sendSessionMessage = async (
+  projectId: string,
+  sessionId: string,
+  body: string
+): Promise<SendSessionMessageResult> => {
+  const trimmedBody = body.trim()
+
+  if (!trimmedBody) {
+    throw new Error("Message body is required")
+  }
+
+  const state = await readStoreState()
+  const project = getProjectFromState(state, projectId)
+  const session = getSessionFromState(state, projectId, sessionId)
+  const workflow = await readWorkflowState(project.workflowPath)
+  const syncedWorkflow = await syncWorkflowArtifacts(project, workflow)
+
+  if (syncedWorkflow.changed) {
+    await writeWorkflowState(project.workflowPath, syncedWorkflow.workflow)
+  }
+
+  const ensuredMessages = await initializeMessageAwareState(
+    state,
+    project,
+    syncedWorkflow.workflow,
+    session
+  )
+  const activePhase = getActiveOrFocusedPhase(syncedWorkflow.workflow)
+  const now = new Date().toISOString()
+
+  const userMessage: SessionMessageRecord = {
+    id: randomUUID(),
+    sessionId,
+    role: "user",
+    label: "You",
+    body: trimmedBody,
+    chips: activePhase ? [activePhase.name] : [],
+    createdAt: now
+  }
+
+  const assistantMessage: SessionMessageRecord = {
+    id: randomUUID(),
+    sessionId,
+    role: "assistant",
+    label: "Workspace",
+    body: activePhase
+      ? `Saved to this session. I’m keeping ${activePhase.name} centered in the workspace and the inspector around ${phasePrimaryArtifacts[activePhase.id]}.`
+      : "Saved to this session. I’m keeping the workspace context and artifact trail aligned.",
+    chips: activePhase ? [phasePrimaryArtifacts[activePhase.id]] : [],
+    createdAt: new Date(Date.now() + 1).toISOString()
+  }
+
+  const nextState = updateProjectTimestamp(
+    {
+      ...ensuredMessages.state,
+      sessions: ensuredMessages.state.sessions.map((item) => {
+        if (item.projectId !== projectId) {
+          return item
+        }
+
+        if (item.id === sessionId) {
+          return {
+            ...item,
+            status: "active" as const,
+            preview: trimmedBody.slice(0, 160),
+            summary: activePhase
+              ? `${activePhase.name} discussion updated in this session.`
+              : "Project discussion updated in this session.",
+            updatedAt: now
+          }
+        }
+
+        return item.status === "active" ? { ...item, status: "idle" as const } : item
+      }),
+      sessionMessages: [...ensuredMessages.state.sessionMessages, userMessage, assistantMessage],
+      activeSessionIdByProject: {
+        ...ensuredMessages.state.activeSessionIdByProject,
+        [projectId]: sessionId
+      }
+    },
+    projectId
+  )
+
+  await writeStoreState(nextState)
+
+  return {
+    dashboard: await buildDashboardData(nextState),
+    messages: [...ensuredMessages.messages, userMessage, assistantMessage]
+  }
+}
+
+export const listWorkspaceEntries = async (
+  projectId: string,
+  relativePath = "",
+  scope: WorkspaceScope
+): Promise<WorkspaceEntry[]> => {
+  const state = await readStoreState()
+  const project = getProjectFromState(state, projectId)
+  const workflow = await readWorkflowState(project.workflowPath)
+  const syncedWorkflow = await syncWorkflowArtifacts(project, workflow)
+
+  if (syncedWorkflow.changed) {
+    await writeWorkflowState(project.workflowPath, syncedWorkflow.workflow)
+  }
+
+  const target = resolveWorkspaceTarget(project.workspacePath, relativePath)
+  const stats = await fs.stat(target.absolutePath).catch(() => null)
+
+  if (!stats || !stats.isDirectory()) {
+    return []
+  }
+
+  const allowedPaths =
+    scope === "changes" ? await getChangedWorkspacePaths(project, syncedWorkflow.workflow) : undefined
+
+  return listEntriesInDirectory(
+    project.workspacePath,
+    target.absolutePath,
+    target.relativePath,
+    allowedPaths
+  )
+}
+
+export const readWorkspaceFile = async (
+  projectId: string,
+  relativePath: string
+): Promise<WorkspaceFileContent> => {
+  const state = await readStoreState()
+  const project = getProjectFromState(state, projectId)
+  const target = resolveWorkspaceTarget(project.workspacePath, relativePath)
+  const stats = await fs.stat(target.absolutePath).catch(() => null)
+
+  if (!stats) {
+    return {
+      path: target.relativePath,
+      name: path.basename(target.relativePath || project.workspacePath),
+      kind: "not_found"
+    }
+  }
+
+  if (stats.isDirectory()) {
+    return {
+      path: target.relativePath,
+      name: path.basename(target.relativePath || project.workspacePath),
+      kind: "directory"
+    }
+  }
+
+  if (stats.size > 1024 * 1024) {
+    return {
+      path: target.relativePath,
+      name: path.basename(target.relativePath),
+      kind: "unsupported"
+    }
+  }
+
+  const descriptor = getTextFileDescriptor(target.relativePath)
+
+  if (!descriptor) {
+    return {
+      path: target.relativePath,
+      name: path.basename(target.relativePath),
+      kind: "unsupported"
+    }
+  }
+
+  return {
+    path: target.relativePath,
+    name: path.basename(target.relativePath),
+    kind: descriptor.kind,
+    language: descriptor.language,
+    content: await fs.readFile(target.absolutePath, "utf8")
+  }
 }
