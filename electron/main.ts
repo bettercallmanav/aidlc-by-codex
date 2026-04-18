@@ -1,9 +1,10 @@
-import { app, BrowserWindow, ipcMain } from "electron";
-import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { app, BrowserWindow, ipcMain } from "electron"
+import path from "node:path"
+import { fileURLToPath } from "node:url"
+import { desktopBridgeHandlers } from "./bridge.js"
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
+const __filename = fileURLToPath(import.meta.url)
+const __dirname = path.dirname(__filename)
 
 const createWindow = async () => {
   const window = new BrowserWindow({
@@ -18,18 +19,17 @@ const createWindow = async () => {
       contextIsolation: true,
       nodeIntegration: false
     }
-  });
+  })
 
-  const devServerUrl = process.env.VITE_DEV_SERVER_URL;
+  const devServerUrl = process.env.VITE_DEV_SERVER_URL
 
   if (devServerUrl) {
-    await window.loadURL(devServerUrl);
-    window.webContents.openDevTools({ mode: "detach" });
-    return;
+    await window.loadURL(devServerUrl)
+    return
   }
 
-  await window.loadFile(path.join(app.getAppPath(), "dist", "index.html"));
-};
+  await window.loadFile(path.join(app.getAppPath(), "dist", "index.html"))
+}
 
 app.whenReady().then(async () => {
   ipcMain.handle("app:get-shell-info", () => {
@@ -39,20 +39,25 @@ app.whenReady().then(async () => {
       chromeVersion: process.versions.chrome,
       nodeVersion: process.versions.node,
       platform: process.platform
-    };
-  });
+    }
+  })
 
-  await createWindow();
+  ipcMain.handle("project:get-dashboard-data", desktopBridgeHandlers.getDashboardData)
+  ipcMain.handle("project:create", desktopBridgeHandlers.createProject)
+  ipcMain.handle("project:select", desktopBridgeHandlers.selectProject)
+  ipcMain.handle("workflow:update-phase-status", desktopBridgeHandlers.updatePhaseStatus)
+
+  await createWindow()
 
   app.on("activate", async () => {
     if (BrowserWindow.getAllWindows().length === 0) {
-      await createWindow();
+      await createWindow()
     }
-  });
-});
+  })
+})
 
 app.on("window-all-closed", () => {
   if (process.platform !== "darwin") {
-    app.quit();
+    app.quit()
   }
-});
+})
