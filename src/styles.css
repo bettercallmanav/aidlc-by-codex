@@ -1,0 +1,201 @@
+:root {
+  color: #f2efe8;
+  background:
+    radial-gradient(circle at top, rgba(218, 142, 68, 0.22), transparent 32%),
+    linear-gradient(180deg, #08101c 0%, #10192d 45%, #18233e 100%);
+  font-family:
+    "IBM Plex Sans",
+    "Segoe UI",
+    sans-serif;
+  line-height: 1.5;
+  font-weight: 400;
+  color-scheme: dark;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-width: 1180px;
+  min-height: 100vh;
+}
+
+button {
+  border: 0;
+  border-radius: 999px;
+  background: linear-gradient(135deg, #f0a65c 0%, #e36f44 100%);
+  color: #10192d;
+  cursor: pointer;
+  font: inherit;
+  font-weight: 700;
+  padding: 0.85rem 1.25rem;
+}
+
+button.secondary {
+  background: rgba(255, 255, 255, 0.08);
+  color: #f2efe8;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+}
+
+#root {
+  min-height: 100vh;
+}
+
+.app-shell {
+  display: grid;
+  grid-template-columns: 320px 1fr;
+  min-height: 100vh;
+}
+
+.sidebar {
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  gap: 1.5rem;
+  padding: 2rem;
+  background: rgba(4, 8, 18, 0.72);
+  border-right: 1px solid rgba(255, 255, 255, 0.08);
+  backdrop-filter: blur(22px);
+}
+
+.sidebar h1,
+.hero-card h2,
+.panel h3,
+.sidebar h2 {
+  margin: 0;
+  font-family:
+    "Space Grotesk",
+    "Avenir Next",
+    sans-serif;
+  letter-spacing: -0.03em;
+}
+
+.sidebar-block,
+.panel,
+.hero-card {
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 24px;
+}
+
+.sidebar-block {
+  padding: 1rem;
+}
+
+.main-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 1.5rem;
+  padding: 2rem;
+}
+
+.hero-card {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+  padding: 1.75rem;
+  background:
+    linear-gradient(135deg, rgba(218, 142, 68, 0.16) 0%, rgba(255, 255, 255, 0.03) 100%),
+    rgba(255, 255, 255, 0.03);
+}
+
+.hero-copy,
+.phase-card p,
+.panel li,
+.sidebar .muted {
+  color: rgba(242, 239, 232, 0.75);
+}
+
+.hero-actions,
+.panel-grid,
+.phase-topline,
+.panel-header {
+  display: flex;
+  gap: 0.75rem;
+}
+
+.panel-grid {
+  align-items: stretch;
+}
+
+.panel {
+  flex: 1;
+  padding: 1.5rem;
+}
+
+.panel-header,
+.phase-topline {
+  justify-content: space-between;
+  align-items: center;
+}
+
+.phase-list,
+.feature-list,
+.runtime-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.9rem;
+  padding: 0;
+  margin: 1rem 0 0;
+  list-style: none;
+}
+
+.phase-card {
+  padding: 1rem;
+  border-radius: 18px;
+  background: rgba(0, 0, 0, 0.16);
+  border: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.eyebrow,
+.section-label,
+.pill,
+.status {
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  font-size: 0.74rem;
+}
+
+.eyebrow,
+.section-label {
+  color: #f0a65c;
+}
+
+.pill,
+.status {
+  display: inline-flex;
+  align-items: center;
+  border-radius: 999px;
+  padding: 0.35rem 0.65rem;
+}
+
+.pill {
+  background: rgba(255, 255, 255, 0.07);
+  color: rgba(242, 239, 232, 0.86);
+}
+
+.status-ready {
+  background: rgba(101, 191, 136, 0.16);
+  color: #8ed7aa;
+}
+
+.status-locked {
+  background: rgba(255, 255, 255, 0.08);
+  color: rgba(242, 239, 232, 0.72);
+}
+
+@media (max-width: 1200px) {
+  body {
+    min-width: auto;
+  }
+
+  .app-shell {
+    grid-template-columns: 1fr;
+  }
+
+  .panel-grid {
+    flex-direction: column;
+  }
+}
