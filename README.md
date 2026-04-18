@@ -144,6 +144,18 @@ The file viewer can render:
 - images
 - Mermaid diagrams inside markdown
 
+## Screenshots
+
+### Workspace
+
+![Workspace screenshot 1](docs/screenshots/workspace-01.png)
+
+![Workspace screenshot 2](docs/screenshots/workspace-02.png)
+
+![Workspace screenshot 3](docs/screenshots/workspace-03.png)
+
+![Workspace screenshot 4](docs/screenshots/workspace-04.png)
+
 ## Running The App
 
 ### Requirements
