@@ -32,7 +32,7 @@ The orchestrator creates `.project-workflow/` with:
 ## Commands
 
 ```bash
-npm run sdlc:init -- --name "Codex Buildathon" --project-type existing-codebase
+npm run sdlc:init -- --name "AIDLC by Codex" --project-type existing-codebase
 npm run sdlc:status
 npm run sdlc:run
 npm run sdlc:approve -- --notes "Discovery looks good"

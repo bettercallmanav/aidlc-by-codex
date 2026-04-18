@@ -236,7 +236,7 @@ const assertDirectory = async (targetPath: string) => {
 const getStoreFilePath = () => path.join(app.getPath("userData"), "projects-state.json")
 
 const getDefaultProjectsBasePath = () =>
-  path.join(app.getPath("documents"), "Codex Buildathon Projects")
+  path.join(app.getPath("documents"), "AIDLC by Codex Projects")
 
 const getWorkflowStatePath = (workflowPath: string) => path.join(workflowPath, "workflow-state.json")
 
@@ -1112,7 +1112,7 @@ const initializeWorkspace = async (project: ProjectRecord, workflowState: Workfl
       path.join(project.workspacePath, "README.md"),
       `# ${project.name}
 
-This project workspace was created by Codex Buildathon.
+This project workspace was created by AIDLC by Codex.
 
 ## Workflow
 - Project type: ${projectTypeLabels[project.projectType]}
@@ -1816,10 +1816,10 @@ const runAutomaticPhaseHandoff = async (input: {
   assistantLabel: string
   directive: ParsedHandoffDirective
   selectedModel: string | null
+  fromPhaseId?: PhaseId | null
 }): Promise<SendSessionMessageResult> => {
-  const currentPhase = getEffectiveAgentPhaseId(input.session, input.workflow)
-    ? getPhaseDefinition(getEffectiveAgentPhaseId(input.session, input.workflow))
-    : null
+  const currentPhaseId = input.fromPhaseId ?? getEffectiveAgentPhaseId(input.session, input.workflow)
+  const currentPhase = currentPhaseId ? getPhaseDefinition(currentPhaseId) : null
 
   if (!currentPhase) {
     throw new Error("Automatic handoff is only supported from phase agents")
@@ -1827,9 +1827,27 @@ const runAutomaticPhaseHandoff = async (input: {
 
   const expectedNextPhaseId = getNextPhaseId(currentPhase.id)
   if (!expectedNextPhaseId || input.directive.nextAgent !== expectedNextPhaseId) {
-    throw new Error(
-      `Invalid handoff target. ${currentPhase.name} can only hand off to ${getPhaseDefinition(expectedNextPhaseId)?.name ?? "the next phase"}.`
-    )
+    const cleanedWorkflow = clearPendingHandoff(input.workflow)
+    const nextState = appendSessionTurnToState({
+      state: input.state,
+      project: input.project,
+      session: input.session,
+      workflow: cleanedWorkflow,
+      userBody: input.userBody,
+      assistantBody: `${currentPhase.name} had a stale or invalid handoff target. I cleared it. Review the current phase and ask the agent to suggest the next handoff again.`,
+      assistantLabel: "Workflow"
+    })
+
+    await writeWorkflowState(input.project.workflowPath, cleanedWorkflow)
+    await writeStoreState(nextState)
+
+    return {
+      dashboard: await buildDashboardData(nextState),
+      messages: nextState.sessionMessages
+        .filter((message) => message.sessionId === input.session.id)
+        .sort((left, right) => left.createdAt.localeCompare(right.createdAt)),
+      uiAction: null
+    }
   }
 
   const nextPhase = getPhaseDefinition(input.directive.nextAgent)
@@ -2682,7 +2700,8 @@ export const sendSessionMessage = async (
         nextAgent: pendingHandoff.toPhaseId,
         reason: pendingHandoff.reason
       },
-      selectedModel: session.selectedModel
+      selectedModel: session.selectedModel,
+      fromPhaseId: pendingHandoff.fromPhaseId
     })
   }
 

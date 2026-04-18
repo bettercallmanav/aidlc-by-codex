@@ -302,8 +302,8 @@ const defaultWorkspaceLayout: WorkspaceLayoutState = {
   openedSdlcArtifactPath: null
 }
 
-const browserStoreKey = "codex-buildathon-browser-store"
-const workspaceLayoutKey = "codex-buildathon-workspace-layout"
+const browserStoreKey = "aidlc-by-codex-browser-store"
+const workspaceLayoutKey = "aidlc-by-codex-workspace-layout"
 const workspaceMinCenterWidth = 460
 const workspaceMaxCenterWidth = 1180
 const inspectorMinMainWidth = 360
@@ -464,7 +464,7 @@ const entryCards = [
 // ]
 
 const fallbackShellInfo: ShellInfo = {
-  appName: "Codex Buildathon (Browser Fallback)",
+  appName: "AIDLC by Codex (Browser Fallback)",
   electronVersion: "Unavailable",
   chromeVersion:
     typeof navigator !== "undefined"

@@ -162,7 +162,7 @@ type JsonRpcNotification = {
 }
 
 const clientInfo = {
-  name: "codex-buildathon",
+  name: "aidlc-by-codex",
   version: "0.1.0"
 }
 

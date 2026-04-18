@@ -1,5 +1,6 @@
 {
-  "name": "codex-buildathon",
+  "name": "aidlc-by-codex",
+  "productName": "AIDLC by Codex",
   "version": "0.1.0",
   "private": true,
   "type": "module",

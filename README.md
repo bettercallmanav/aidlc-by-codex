@@ -1,6 +1,6 @@
-# Codex Buildathon
+# AIDLC by Codex
 
-Codex Buildathon is a local-first Electron app for running an AI-assisted SDLC workflow against a real project folder.
+AIDLC by Codex is a local-first Electron app for running an AI-assisted SDLC workflow against a real project folder.
 
 It is built around one idea:
 
@@ -17,6 +17,18 @@ The app gives you:
 - local artifact generation under `.project-workflow/`
 - Codex-backed chat with file edits, command execution, and agent handoff support
 - wireframe image generation for the `Wireframe` phase
+
+## Screenshots
+
+### Workspace
+
+![Workspace screenshot 1](docs/screenshots/workspace-01.png)
+
+![Workspace screenshot 2](docs/screenshots/workspace-02.png)
+
+![Workspace screenshot 3](docs/screenshots/workspace-03.png)
+
+![Workspace screenshot 4](docs/screenshots/workspace-04.png)
 
 ## Core Concepts
 
@@ -143,18 +155,6 @@ The file viewer can render:
 - code/text files
 - images
 - Mermaid diagrams inside markdown
-
-## Screenshots
-
-### Workspace
-
-![Workspace screenshot 1](docs/screenshots/workspace-01.png)
-
-![Workspace screenshot 2](docs/screenshots/workspace-02.png)
-
-![Workspace screenshot 3](docs/screenshots/workspace-03.png)
-
-![Workspace screenshot 4](docs/screenshots/workspace-04.png)
 
 ## Running The App
 
