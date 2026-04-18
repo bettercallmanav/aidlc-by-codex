@@ -57,7 +57,29 @@ type PendingTurn = {
   sessionId: string
 }
 
+type HandoffSessionPayload = {
+  id: string
+  projectId: string
+  title: string
+  titleSource: string
+  kind: string
+  status: string
+  summary: string
+  preview: string
+  selectedModel: string | null
+  selectedAgentId: string
+  createdAt: string
+  updatedAt: string
+}
+
 export type CodexChatEvent =
+  | {
+      projectId: string
+      sessionId: string
+      type: "handoff_started"
+      phaseId: string
+      session: HandoffSessionPayload
+    }
   | {
       projectId: string
       sessionId: string
@@ -146,6 +168,10 @@ const clientInfo = {
 
 const codexEvents = new EventEmitter()
 
+export const emitCodexUiEvent = (event: CodexChatEvent) => {
+  codexEvents.emit("event", event)
+}
+
 class CodexAppServerClient {
   private process: ChildProcessWithoutNullStreams | null = null
   private requests = new Map<string | number, PendingRequest>()
@@ -157,7 +183,7 @@ class CodexAppServerClient {
   private stderrBuffer = ""
 
   private emit(event: CodexChatEvent) {
-    codexEvents.emit("event", event)
+    emitCodexUiEvent(event)
   }
 
   private async ensureStarted() {
@@ -540,11 +566,13 @@ class CodexAppServerClient {
         const pendingTurn = this.pendingTurns.get(conversationId)
 
         if (pendingTurn) {
+          this.pendingTurns.delete(conversationId)
           this.emit({
             projectId: pendingTurn.projectId,
             sessionId: pendingTurn.sessionId,
             type: "interrupted"
           })
+          pendingTurn.reject(new Error("Codex turn interrupted."))
         }
       }
 
@@ -726,14 +754,26 @@ class CodexAppServerClient {
     }
 
     const [conversationId, turn] = activeTurn
-    await this.request("interruptConversation", {
-      conversationId
-    })
+    this.pendingTurns.delete(conversationId)
+
+    try {
+      await this.request("interruptConversation", {
+        conversationId
+      })
+    } catch (error) {
+      turn.reject(
+        error instanceof Error ? error : new Error("Unable to interrupt Codex conversation.")
+      )
+      throw error
+    }
+
     this.emit({
       projectId: turn.projectId,
       sessionId: turn.sessionId,
-      type: "interrupted"
+      type: "interrupted",
+      reason: "Stopped by user"
     })
+    turn.reject(new Error("Codex turn interrupted."))
     return true
   }
 }

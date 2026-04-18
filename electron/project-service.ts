@@ -2,7 +2,7 @@ import { app } from "electron"
 import { randomUUID } from "node:crypto"
 import fs from "node:fs/promises"
 import path from "node:path"
-import { sendCodexSessionMessage } from "./codex-app-server.js"
+import { emitCodexUiEvent, sendCodexSessionMessage } from "./codex-app-server.js"
 import {
   getPhaseDefinition,
   getNextPhaseId,
@@ -1892,6 +1892,27 @@ const runAutomaticPhaseHandoff = async (input: {
     nextSession
   )
   nextState = nextSessionMessages.state
+
+  emitCodexUiEvent({
+    projectId: input.project.id,
+    sessionId: nextSession.id,
+    type: "handoff_started",
+    phaseId: nextPhase.id,
+    session: {
+      id: nextSession.id,
+      projectId: nextSession.projectId,
+      title: nextSession.title,
+      titleSource: nextSession.titleSource,
+      kind: nextSession.kind,
+      status: "active",
+      summary: nextSession.summary,
+      preview: nextSession.preview,
+      selectedModel: input.selectedModel,
+      selectedAgentId: nextPhase.id,
+      createdAt: nextSession.createdAt,
+      updatedAt: new Date().toISOString()
+    }
+  })
 
   const kickoffBody = buildAutomaticPhaseKickoff({
     currentPhase,

@@ -10,6 +10,7 @@ import {
   type MouseEvent as ReactMouseEvent,
   type ReactNode
 } from "react"
+import mermaid from "mermaid"
 
 type ShellInfo = {
   appName: string
@@ -185,6 +186,13 @@ type SendSessionMessageResult = {
 }
 
 type CodexChatEvent =
+  | {
+      projectId: string
+      sessionId: string
+      type: "handoff_started"
+      phaseId: string
+      session: SessionRecord
+    }
   | { projectId: string; sessionId: string; type: "turn_started" }
   | { projectId: string; sessionId: string; type: "assistant_delta"; delta: string }
   | { projectId: string; sessionId: string; type: "command_started"; command: string; cwd?: string }
@@ -486,6 +494,90 @@ const createId = () =>
     ? crypto.randomUUID()
     : `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`
 
+let mermaidInitialized = false
+
+const ensureMermaidInitialized = () => {
+  if (mermaidInitialized) {
+    return
+  }
+
+  mermaid.initialize({
+    startOnLoad: false,
+    securityLevel: "loose",
+    theme: "base",
+    themeVariables: {
+      background: "#faf7f0",
+      primaryColor: "#edf5f2",
+      primaryTextColor: "#2d2a26",
+      primaryBorderColor: "#1f6b63",
+      lineColor: "#655d53",
+      secondaryColor: "#fffdf8",
+      tertiaryColor: "#f3eee5",
+      fontFamily: "IBM Plex Sans, Segoe UI, sans-serif"
+    }
+  })
+
+  mermaidInitialized = true
+}
+
+const MermaidBlock = ({ chart }: { chart: string }) => {
+  const renderIdRef = useRef(`mermaid-${createId()}`)
+  const [svg, setSvg] = useState<string | null>(null)
+  const [error, setError] = useState<string | null>(null)
+
+  useEffect(() => {
+    let cancelled = false
+
+    ensureMermaidInitialized()
+    setSvg(null)
+    setError(null)
+
+    mermaid
+      .render(renderIdRef.current, chart)
+      .then(({ svg: nextSvg }) => {
+        if (!cancelled) {
+          setSvg(nextSvg)
+        }
+      })
+      .catch((renderError) => {
+        if (!cancelled) {
+          setError(renderError instanceof Error ? renderError.message : "Unable to render Mermaid")
+        }
+      })
+
+    return () => {
+      cancelled = true
+    }
+  }, [chart])
+
+  if (error) {
+    return (
+      <div className="markdown-mermaid-error">
+        <strong>Mermaid render failed</strong>
+        <p>{error}</p>
+        <pre className="markdown-code-block">
+          <code>{chart}</code>
+        </pre>
+      </div>
+    )
+  }
+
+  if (!svg) {
+    return (
+      <div className="markdown-mermaid-loading">
+        <span>Rendering diagram…</span>
+      </div>
+    )
+  }
+
+  return (
+    <div
+      className="markdown-mermaid-diagram"
+      dangerouslySetInnerHTML={{ __html: svg }}
+    />
+  )
+}
+
 const slugify = (value: string) =>
   value
     .toLowerCase()
@@ -541,7 +633,12 @@ const renderInlineMarkdown = (text: string, keyPrefix: string): ReactNode[] =>
     return part
   })
 
-const renderMarkdownContent = (content: string): JSX.Element[] => {
+const renderMarkdownContent = (
+  content: string,
+  options?: {
+    renderMermaid?: boolean
+  }
+): JSX.Element[] => {
   const lines = content.replace(/\r/g, "").split("\n")
   const blocks: JSX.Element[] = []
   let index = 0
@@ -570,11 +667,21 @@ const renderMarkdownContent = (content: string): JSX.Element[] => {
         index += 1
       }
 
-      blocks.push(
-        <pre key={`markdown-block-${blockKey++}`} className="markdown-code-block">
-          <code data-language={language || undefined}>{codeLines.join("\n")}</code>
-        </pre>
-      )
+      const code = codeLines.join("\n")
+
+      if (options?.renderMermaid && language.toLowerCase() === "mermaid") {
+        blocks.push(
+          <div key={`markdown-block-${blockKey++}`} className="markdown-mermaid-block">
+            <MermaidBlock chart={code} />
+          </div>
+        )
+      } else {
+        blocks.push(
+          <pre key={`markdown-block-${blockKey++}`} className="markdown-code-block">
+            <code data-language={language || undefined}>{code}</code>
+          </pre>
+        )
+      }
       continue
     }
 
@@ -2141,6 +2248,67 @@ function App() {
     }
 
     return window.desktopBridge.onCodexEvent((event) => {
+      if (event.type === "handoff_started") {
+        startTransition(() => {
+          setDashboard((current) => {
+            const nextAllSessions = (() => {
+              const existingIndex = current.allSessions.findIndex(
+                (session) => session.id === event.session.id
+              )
+
+              if (existingIndex === -1) {
+                return [
+                  event.session,
+                  ...current.allSessions.map((session) =>
+                    session.projectId === event.projectId && session.status === "active"
+                      ? { ...session, status: "idle" as const }
+                      : session
+                  )
+                ]
+              }
+
+              return current.allSessions.map((session) =>
+                session.id === event.session.id
+                  ? event.session
+                  : session.projectId === event.projectId && session.status === "active"
+                    ? { ...session, status: "idle" as const }
+                    : session
+              )
+            })()
+
+            const nextProjectSessions = nextAllSessions
+              .filter((session) => session.projectId === event.projectId && session.status !== "archived")
+              .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))
+
+            if (current.activeProject?.id !== event.projectId) {
+              return {
+                ...current,
+                allSessions: nextAllSessions
+              }
+            }
+
+            return {
+              ...current,
+              sessions: nextProjectSessions,
+              activeSession: event.session,
+              allSessions: nextAllSessions
+            }
+          })
+          setSessionMessages([])
+          setLiveTurn({
+            projectId: event.projectId,
+            sessionId: event.sessionId,
+            assistantText: "",
+            started: false
+          })
+          patchLayout({
+            selectedSdlcPhase: event.phaseId,
+            openedSdlcArtifactPath: null
+          })
+        })
+        return
+      }
+
       setLiveTurn((current) => {
         if (
           !current ||
@@ -2170,18 +2338,17 @@ function App() {
           event.type === "command_completed" ||
           event.type === "file_change" ||
           event.type === "tool_started" ||
-          event.type === "tool_completed" ||
-          event.type === "interrupted" ||
-          event.type === "error"
+          event.type === "tool_completed"
         ) {
           return current
         }
 
+        if (event.type === "interrupted" || event.type === "error") {
+          return null
+        }
+
         if (event.type === "turn_completed") {
-          return {
-            ...current,
-            started: true
-          }
+          return current
         }
 
         return current
@@ -2710,7 +2877,12 @@ function App() {
         void openFileInInspector(result.uiAction.relativePath, result.uiAction.targetTab)
       }
     } catch (messageError) {
-      setError(messageError instanceof Error ? messageError.message : "Unable to send message")
+      const errorMessage =
+        messageError instanceof Error ? messageError.message : "Unable to send message"
+      const wasInterrupted = /interrupted/i.test(errorMessage)
+      if (!wasInterrupted) {
+        setError(errorMessage)
+      }
       setSessionMessages((current) =>
         current.filter((message) => message.id !== optimisticUserMessage.id)
       )
@@ -2721,17 +2893,17 @@ function App() {
   }
 
   const handleInterruptSession = async () => {
-    const activeProject = dashboard.activeProject
-    const activeSession = dashboard.activeSession
+    const targetProjectId = liveTurn?.projectId ?? dashboard.activeProject?.id ?? null
+    const targetSessionId = liveTurn?.sessionId ?? dashboard.activeSession?.id ?? null
 
-    if (!activeProject || !activeSession) {
+    if (!targetProjectId || !targetSessionId) {
       return
     }
 
     try {
       await getBridge().interruptSession({
-        projectId: activeProject.id,
-        sessionId: activeSession.id
+        projectId: targetProjectId,
+        sessionId: targetSessionId
       })
     } catch (interruptError) {
       setError(interruptError instanceof Error ? interruptError.message : "Unable to interrupt turn")
@@ -3017,7 +3189,9 @@ function App() {
         </div>
         <p className="document-path">{content.path}</p>
         {content.kind === "markdown" ? (
-          <div className="document-content document-content-markdown">{renderMarkdownContent(content.content ?? "")}</div>
+          <div className="document-content document-content-markdown">
+            {renderMarkdownContent(content.content ?? "", { renderMermaid: true })}
+          </div>
         ) : (
           <pre className={`document-content document-content-${content.kind}`}>
             <code>{content.content}</code>
@@ -3869,13 +4043,13 @@ function App() {
             {activeProject?.name ?? "Workspace"} · {activeSession?.selectedModel ?? "default model"} · Enter to send · Shift+Enter for newline
           </span>
           <div className="composer-button-row">
-            {isSendingMessage ? (
-              <button type="button" className="secondary action-button" onClick={handleInterruptSession}>
-                Interrupt
-              </button>
-            ) : null}
-            <button type="submit" className="composer-send" disabled={isSendingMessage}>
-              {isSendingMessage ? "…" : "→"}
+            <button
+              type={isSendingMessage ? "button" : "submit"}
+              className={`composer-send ${isSendingMessage ? "composer-send-stop composer-send-streaming" : ""}`}
+              disabled={!isSendingMessage && !promptDraft.trim()}
+              onClick={isSendingMessage ? () => void handleInterruptSession() : undefined}
+            >
+              {isSendingMessage ? "Stop" : "→"}
             </button>
           </div>
         </div>
@@ -4070,7 +4244,13 @@ function App() {
   const renderInspector = () => (
     <aside
       className={`inspector-shell card ${shouldShowInspectorMain ? "" : "inspector-shell-collapsed"}`}
-      style={{ width: `${shouldShowInspectorMain ? layout.inspectorWidth : layout.reviewSidebarWidth}px` }}
+      style={{
+        width: `${
+          shouldShowInspectorMain
+            ? layout.inspectorWidth + paneResizerWidth + layout.reviewSidebarWidth
+            : layout.reviewSidebarWidth
+        }px`
+      }}
     >
       {shouldShowInspectorMain ? (
         <>
